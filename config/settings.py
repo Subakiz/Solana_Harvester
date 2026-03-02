@@ -83,7 +83,9 @@ class Settings:
     DATA_RESUME_WAIT_SECONDS: float = _env("DATA_RESUME_WAIT_SECONDS", 30.0, float)
 
     # ── Rate Limits ───────────────────────────────────────────
-    DEX_RPM: int = _env("DEXSCREENER_REQUESTS_PER_MINUTE", 58, int)
+    # DEX_RPM is set high to disable the legacy AsyncRateLimiter; the
+    # TieredPoller (API_RATE_LIMIT = 55) is the sole rate controller.
+    DEX_RPM: int = _env("DEXSCREENER_REQUESTS_PER_MINUTE", 300, int)
     RPC_RPM: int = _env("RPC_REQUESTS_PER_MINUTE", 20, int)
 
     # ── Tiered Polling (v3.1) ─────────────────────────────────

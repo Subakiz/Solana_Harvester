@@ -119,7 +119,12 @@ class PaperTradingEngine:
 
     async def initialize(self):
         """Load open trades from previous session and run initial optimization."""
-        self._day_start_balance = self.db.balance
+        # Load day_start_balance from DB: most recent balance_after at or before midnight UTC
+        self._day_start_balance = await self.db.get_balance_at(self._day_start_ts)
+        log.info(
+            f"📅 Day start balance loaded: ${self._day_start_balance:,.2f} "
+            f"(midnight UTC: {time.ctime(self._day_start_ts)})"
+        )
 
         open_trades = await self.db.get_open_trades()
         for row in open_trades:
@@ -261,7 +266,7 @@ class PaperTradingEngine:
             log.info(f"{'═' * 60}")
 
         # Reset day tracking if new UTC day
-        self._check_day_reset()
+        await self._check_day_reset()
 
         await self._maybe_reoptimize_tp()
         await self._ingest_tiered()
@@ -756,7 +761,7 @@ class PaperTradingEngine:
         await self.db.insert_quant_signal(
             trade_id=trade_id,
             hurst_value=H or 0.0, cvd_value=cvd_val or 0.0,
-            cvd_slope=cvd_slope or 0.0, gini_coeff=gini or 0.0,
+            cvd_slope=cvd_slope or 0.0, gini_coeff=gini,
             snapshot_count=buf.count, buy_ratio=buy_ratio,
         )
         self.positions[buf.mint] = LivePaperPosition(
@@ -790,18 +795,25 @@ class PaperTradingEngine:
 
     async def _check_circuit_breaker(self):
         """Check if daily loss limit has been exceeded."""
-        daily_loss = await self.db.get_daily_realized_loss(self._day_start_ts)
         if self._day_start_balance <= 0:
             return
 
-        loss_pct = abs(daily_loss) / self._day_start_balance
+        current_balance = self.db.balance
+        daily_loss_amount = self._day_start_balance - current_balance
+        loss_pct = daily_loss_amount / self._day_start_balance
+
+        log.debug(
+            f"Circuit breaker check: day_start=${self._day_start_balance:,.2f} "
+            f"current=${current_balance:,.2f} "
+            f"daily_pnl={-daily_loss_amount:+,.2f} ({-loss_pct:+.1%}) "
+            f"threshold={Settings.DAILY_LOSS_LIMIT_PCT:.0%}"
+        )
+
         if loss_pct >= Settings.DAILY_LOSS_LIMIT_PCT:
             self._circuit_breaker_until = (
                 time.time() + Settings.CIRCUIT_BREAKER_MINUTES * 60
             )
             self._circuit_breaker_active = True
-            # Reset threshold to current balance after CB
-            self._day_start_balance = self.db.balance
 
             log.critical(
                 f"CIRCUIT_BREAKER: Daily loss {loss_pct:.1%} exceeds "
@@ -816,18 +828,24 @@ class PaperTradingEngine:
                     f"Paused until {time.ctime(self._circuit_breaker_until)}"
                 ),
                 metadata={
-                    "daily_loss": daily_loss,
+                    "day_start_balance": self._day_start_balance,
+                    "current_balance": current_balance,
+                    "daily_loss_amount": daily_loss_amount,
                     "loss_pct": loss_pct,
                     "resume_time": self._circuit_breaker_until,
                 },
             )
 
-    def _check_day_reset(self):
+    async def _check_day_reset(self):
         """Reset daily tracking at UTC midnight."""
         current_day_start = self._utc_day_start()
         if current_day_start > self._day_start_ts:
             self._day_start_ts = current_day_start
-            self._day_start_balance = self.db.balance
+            self._day_start_balance = await self.db.get_balance_at(current_day_start)
+            log.info(
+                f"📅 Day rollover: new day_start_balance=${self._day_start_balance:,.2f} "
+                f"(midnight UTC: {time.ctime(current_day_start)})"
+            )
 
     @staticmethod
     def _utc_day_start() -> float:

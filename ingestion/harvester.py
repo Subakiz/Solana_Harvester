@@ -122,6 +122,13 @@ class DataHarvester:
         self._gini_cache: dict[str, tuple[float, float]] = {} # mint -> (gini, ts)
         self._gini_cache_ttl = 180.0 # 3 minutes
 
+        # Helius RPC 401 tracking — short-circuit after consecutive failures
+        self._rpc_consecutive_401s: int = 0
+        self._rpc_401_threshold: int = 5       # Disable after this many consecutive 401s
+        self._rpc_eval_count: int = 0           # Total holder queries attempted
+        self._rpc_retry_interval: int = 50      # Retry every N evaluations when disabled
+        self._rpc_disabled_logged: bool = False  # Only log the disable warning once
+
         # Performance counters (reset each poll for logging)
         self._poll_stats: dict[str, int] = {}
 
@@ -691,19 +698,40 @@ class DataHarvester:
         t3_cfg = self.poller._tier_configs[TokenTier.WARM_SCANNER]
 
         for pair in raw_pairs:
+            # Check chain before parsing identity (wrong_chain is a common drop)
+            chain_id = pair.get("chainId", "")
+            if chain_id != "solana":
+                rejected_reasons["wrong_chain"] = rejected_reasons.get("wrong_chain", 0) + 1
+                continue
+
             ident = self._parse_identity(pair)
             if not ident:
+                # Distinguish no mint vs no pair address
+                bt = pair.get("baseToken") or {}
+                mint_raw = (bt.get("address") or "").strip()
+                pa_raw = (pair.get("pairAddress") or "").strip()
+                if not mint_raw:
+                    rejected_reasons["no_mint_address"] = rejected_reasons.get("no_mint_address", 0) + 1
+                elif not pa_raw:
+                    rejected_reasons["no_pair_address"] = rejected_reasons.get("no_pair_address", 0) + 1
+                else:
+                    rejected_reasons["parse_failed"] = rejected_reasons.get("parse_failed", 0) + 1
                 continue
             mint, symbol, name, pa, dex = ident
 
             # Skip already tracked
             if mint in self.poller.tokens:
+                rejected_reasons["already_tracked"] = rejected_reasons.get("already_tracked", 0) + 1
                 continue
 
             liquidity = float((pair.get("liquidity") or {}).get("usd") or 0)
             mcap = float(pair.get("marketCap") or pair.get("fdv") or 0)
             volume_5m = float((pair.get("volume") or {}).get("m5") or 0)
+            price = float(pair.get("priceUsd") or 0)
 
+            if price <= 0:
+                rejected_reasons["zero_price"] = rejected_reasons.get("zero_price", 0) + 1
+                continue
             if liquidity < Settings.DISCOVERY_MIN_LIQUIDITY:
                 rejected_reasons["low_liquidity"] = rejected_reasons.get("low_liquidity", 0) + 1
                 continue
@@ -725,7 +753,6 @@ class DataHarvester:
 
             buys_5m = int((pair.get("txns") or {}).get("m5", {}).get("buys") or 0)
             sells_5m = int((pair.get("txns") or {}).get("m5", {}).get("sells") or 0)
-            price = float(pair.get("priceUsd") or 0)
 
             tracked = TrackedToken(
                 mint=mint,
@@ -761,12 +788,13 @@ class DataHarvester:
                 f"Vol5m ${volume_5m:,.0f} │ DEX: {dex}"
             )
 
-        if added > 0 or rejected_reasons:
-            log.info(
-                f"🔍 Discovery: {len(raw_pairs)} pairs found, "
-                f"{added} added to scanner, "
-                f"rejected: {rejected_reasons}"
-            )
+        # Always log discovery results with full accounting
+        total_accounted = added + sum(rejected_reasons.values())
+        log.info(
+            f"🔍 Discovery: {len(raw_pairs)} pairs → "
+            f"{added} added │ rejected: {rejected_reasons} │ "
+            f"accounted: {total_accounted}/{len(raw_pairs)}"
+        )
         return added
 
     def _update_legacy_buffer(
@@ -826,7 +854,21 @@ class DataHarvester:
             _, cached_ts = self._gini_cache[mint]
             if time.time() - cached_ts < self._gini_cache_ttl:
                 return None
-                
+
+        # Short-circuit if Helius RPC is returning 401s
+        self._rpc_eval_count += 1
+        if self._rpc_consecutive_401s >= self._rpc_401_threshold:
+            # Periodically retry to detect if the key starts working again
+            if self._rpc_eval_count % self._rpc_retry_interval != 0:
+                if not self._rpc_disabled_logged:
+                    log.warning(
+                        f"Helius RPC disabled — last {self._rpc_consecutive_401s} "
+                        f"queries returned 401. Retrying every "
+                        f"{self._rpc_retry_interval} evaluations."
+                    )
+                    self._rpc_disabled_logged = True
+                return None
+
         await self.rpc_limiter.acquire()
         session = await self._solana_session()
         payload = orjson.dumps({
@@ -836,9 +878,17 @@ class DataHarvester:
             async with session.post(
                 Settings.SOLANA_RPC_URL, data=payload, headers={"Content-Type": "application/json"},
             ) as resp:
+                if resp.status == 401:
+                    self._rpc_consecutive_401s += 1
+                    if self._rpc_consecutive_401s <= self._rpc_401_threshold:
+                        log.warning(f"RPC HTTP 401 for holders of {mint[:8]}… (consecutive: {self._rpc_consecutive_401s})")
+                    return None
                 if resp.status != 200:
                     log.warning(f"RPC HTTP {resp.status} for holders of {mint[:8]}…")
                     return None
+                # Successful non-401 response — reset the counter
+                self._rpc_consecutive_401s = 0
+                self._rpc_disabled_logged = False
                 data = await resp.json(content_type=None)
                 if "error" in data:
                     log.error(f"RPC error: {data['error']}")

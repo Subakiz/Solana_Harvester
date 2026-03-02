@@ -97,7 +97,9 @@ class PaperTradingEngine:
 
         # ── Risk management state ────────────────────────────
         self._circuit_breaker_until: float = 0.0  # timestamp when CB expires
+        self._circuit_breaker_active: bool = False  # True while CB is active
         self._loss_cooldown_until: float = 0.0    # timestamp when cooldown expires
+        self._loss_cooldown_active: bool = False   # True while cooldown is active
         self._day_start_ts: float = self._utc_day_start()
         self._day_start_balance: float = 0.0
 
@@ -412,6 +414,7 @@ class PaperTradingEngine:
         # Check for large loss cooldown
         if result and result.get("net_pnl_pct", 0) <= Settings.LARGE_LOSS_THRESHOLD_PCT:
             self._loss_cooldown_until = time.time() + Settings.LOSS_COOLDOWN_MINUTES * 60
+            self._loss_cooldown_active = True
             log.warning(
                 f"LOSS_COOLDOWN: Trade {pos.trade_id} lost "
                 f"{result['net_pnl_pct']:.2%}. "
@@ -500,18 +503,26 @@ class PaperTradingEngine:
             remaining = (self._circuit_breaker_until - now) / 60
             log.info(f"  🔴 Circuit breaker active — {remaining:.1f}min remaining")
             return
+        elif self._circuit_breaker_active:
+            # Circuit breaker just expired — emit reset event once
+            self._circuit_breaker_active = False
+            await self.db.insert_system_event(
+                event_type="CIRCUIT_BREAKER_RESET", severity="INFO",
+                description="Circuit breaker cooldown expired, resuming trading",
+            )
 
         # Check loss cooldown
         if now < self._loss_cooldown_until:
             remaining = (self._loss_cooldown_until - now) / 60
             log.info(f"  🟡 Loss cooldown active — {remaining:.1f}min remaining")
-            # Check if cooldown just expired
-            if now >= self._loss_cooldown_until:
-                await self.db.insert_system_event(
-                    event_type="LOSS_COOLDOWN_END", severity="INFO",
-                    description="Loss cooldown expired, resuming trading",
-                )
             return
+        elif self._loss_cooldown_active:
+            # Loss cooldown just expired — emit end event once
+            self._loss_cooldown_active = False
+            await self.db.insert_system_event(
+                event_type="LOSS_COOLDOWN_END", severity="INFO",
+                description="Loss cooldown expired, resuming trading",
+            )
 
         analyzable = self.harvester.analyzable_tokens()
         log.info(f"🔬 Scanning {len(analyzable)} tokens for entry signals…")
@@ -727,6 +738,7 @@ class PaperTradingEngine:
             self._circuit_breaker_until = (
                 time.time() + Settings.CIRCUIT_BREAKER_MINUTES * 60
             )
+            self._circuit_breaker_active = True
             # Reset threshold to current balance after CB
             self._day_start_balance = self.db.balance
 

@@ -678,6 +678,12 @@ class DatabaseManager:
                         event_type="ALERT_DATA_TIMEOUTS", severity="CRITICAL",
                         description=f"Data timeouts {data_timeouts} exceed 10% of trades",
                     )
+            elif total < 5:
+                # Fewer than 5 trades in snapshot period may indicate data feed failure
+                await self.insert_system_event(
+                    event_type="ALERT_LOW_TRADE_COUNT", severity="CRITICAL",
+                    description=f"Only {total} trades in last hour — possible data feed failure",
+                )
 
             # Check rejection rate
             total_rejections = sum(rej_counts.values())

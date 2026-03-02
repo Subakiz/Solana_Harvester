@@ -800,7 +800,7 @@ class PaperTradingEngine:
 
         current_balance = self.db.balance
         daily_loss_amount = self._day_start_balance - current_balance
-        loss_pct = daily_loss_amount / self._day_start_balance if self._day_start_balance > 0 else 0.0
+        loss_pct = daily_loss_amount / self._day_start_balance
 
         log.debug(
             f"Circuit breaker check: day_start=${self._day_start_balance:,.2f} "

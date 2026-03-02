@@ -474,7 +474,7 @@ class DatabaseManager:
 
     async def insert_quant_signal(self, *, trade_id: str, hurst_value: float,
                                   cvd_value: float, cvd_slope: float,
-                                  gini_coeff: float, snapshot_count: int,
+                                  gini_coeff: float = None, snapshot_count: int,
                                   buy_ratio: float = 0.0):
         try:
             await self._db.execute(

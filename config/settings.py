@@ -83,7 +83,7 @@ class Settings:
     DATA_RESUME_WAIT_SECONDS: float = _env("DATA_RESUME_WAIT_SECONDS", 30.0, float)
 
     # ── Rate Limits ───────────────────────────────────────────
-    DEX_RPM: int = _env("DEXSCREENER_REQUESTS_PER_MINUTE", 30, int)
+    DEX_RPM: int = _env("DEXSCREENER_REQUESTS_PER_MINUTE", 58, int)
     RPC_RPM: int = _env("RPC_REQUESTS_PER_MINUTE", 20, int)
 
     # ── Tiered Polling (v3.1) ─────────────────────────────────

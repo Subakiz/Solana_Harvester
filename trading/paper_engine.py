@@ -38,6 +38,9 @@ OPTIMIZER_MIN_TRADES = 5        # Minimum trades before first optimization
 OPTIMIZER_LOOKBACK = 100        # How many recent trades to feed optimizer
 DEFAULT_TAKE_PROFIT = 0.20      # 20% default before optimizer has data
 
+# Ticks older than this are not re-persisted in tiered ingest (avoids duplicate DB writes)
+FRESH_TICK_WINDOW_SECONDS = 2.0
+
 
 @dataclass
 class LivePaperPosition:
@@ -274,8 +277,8 @@ class PaperTradingEngine:
 
         # Periodic tier-distribution summary (every 30 seconds)
         now = time.time()
-        if int(now) % 30 == 0 and getattr(self, '_last_tier_log', 0) != int(now) // 30:
-            self._last_tier_log = int(now) // 30
+        if int(now) % 30 == 0 and int(now) != getattr(self, '_last_tier_log', -1):
+            self._last_tier_log = int(now)
             open_mints = set(self.positions.keys())
             tier_counts = self.harvester.poller.tier_counts()
             budget = self.harvester.poller._requests_in_window()
@@ -300,8 +303,8 @@ class PaperTradingEngine:
         for mint, buf in self.harvester.tokens.items():
             if buf.ticks:
                 t = buf.ticks[-1]
-                # Only persist if tick is recent (updated within last 2 seconds)
-                if time.time() - t.timestamp < 2.0:
+                # Only persist if tick is recent (updated within freshness window)
+                if time.time() - t.timestamp < FRESH_TICK_WINDOW_SECONDS:
                     await self.db.insert_tick(
                         mint=buf.mint, symbol=buf.symbol, price_usd=t.price_usd,
                         liquidity_usd=t.liquidity_usd, volume_5m=t.volume_5m,

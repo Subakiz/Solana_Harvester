@@ -213,9 +213,17 @@ class TieredPoller:
         hot_min_mcap: float = 40000.0,
         hot_max_mcap: float = 2500000.0,
         hot_min_activity: int = 2,
+        hot_promote_max_zero_vol: int = 3,   # Max consecutive zero-vol polls for T2 promotion
+        hot_demote_min_volume: float = 50.0,  # Volume below which T2 is demoted
+        hot_demote_min_liquidity: float = 10000.0,
+        hot_demote_min_mcap: float = 20000.0,
+        hot_demote_max_mcap: float = 3000000.0,
+        hot_demote_zero_vol: int = 5,         # Zero-vol polls that trigger T2 demotion
         dead_zero_vol_polls: int = 20,
         dead_min_liquidity: float = 3000.0,
+        dead_min_mcap: float = 5000.0,        # Mcap below this → token effectively rugged
         stale_max_age_hours: float = 2.0,
+        stale_min_volume: float = 10.0,       # Min volume to keep a stale-age token
     ):
         """
         Reclassify tokens into tiers based on current state.
@@ -242,7 +250,7 @@ class TieredPoller:
                 token.last_volume_5m >= hot_min_volume
                 and token.last_liquidity >= hot_min_liquidity
                 and hot_min_mcap <= token.last_mcap <= hot_max_mcap
-                and token.consecutive_zero_vol < 3
+                and token.consecutive_zero_vol < hot_promote_max_zero_vol
                 and (token.last_buys_5m + token.last_sells_5m) >= hot_min_activity
             )
 
@@ -260,11 +268,11 @@ class TieredPoller:
             # TIER 2 DEMOTION CRITERIA
             if token.tier == TokenTier.HOT_WATCHLIST:
                 demote = (
-                    token.last_volume_5m < 50
-                    or token.last_liquidity < 10000
-                    or token.last_mcap < 20000
-                    or token.last_mcap > 3000000
-                    or token.consecutive_zero_vol >= 5
+                    token.last_volume_5m < hot_demote_min_volume
+                    or token.last_liquidity < hot_demote_min_liquidity
+                    or token.last_mcap < hot_demote_min_mcap
+                    or token.last_mcap > hot_demote_max_mcap
+                    or token.consecutive_zero_vol >= hot_demote_zero_vol
                 )
                 if demote:
                     token.tier = TokenTier.WARM_SCANNER
@@ -285,11 +293,11 @@ class TieredPoller:
             and mint not in open_position_mints
             and (
                 t.consecutive_zero_vol >= dead_zero_vol_polls
-                or t.last_mcap < 5000
+                or t.last_mcap < dead_min_mcap
                 or t.last_liquidity < dead_min_liquidity
                 or (
                     now - t.added_time > stale_age_seconds
-                    and t.last_volume_5m < 10
+                    and t.last_volume_5m < stale_min_volume
                 )
             )
         ]

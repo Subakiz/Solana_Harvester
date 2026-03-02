@@ -716,6 +716,15 @@ class DataHarvester:
                     rejected_reasons["no_pair_address"] = rejected_reasons.get("no_pair_address", 0) + 1
                 else:
                     rejected_reasons["parse_failed"] = rejected_reasons.get("parse_failed", 0) + 1
+                    log.debug(
+                        f"[Discovery] parse_failed for pair — "
+                        f"chainId={pair.get('chainId')!r} "
+                        f"dexId={pair.get('dexId')!r} "
+                        f"mint={mint_raw!r} "
+                        f"pairAddress={pa_raw!r} "
+                        f"symbol={((pair.get('baseToken') or {}).get('symbol'))!r} "
+                        f"raw={pair}"
+                    )
                 continue
             mint, symbol, name, pa, dex = ident
 

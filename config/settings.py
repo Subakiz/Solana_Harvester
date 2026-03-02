@@ -86,6 +86,33 @@ class Settings:
     DEX_RPM: int = _env("DEXSCREENER_REQUESTS_PER_MINUTE", 30, int)
     RPC_RPM: int = _env("RPC_REQUESTS_PER_MINUTE", 20, int)
 
+    # ── Tiered Polling (v3.1) ─────────────────────────────────
+    MAIN_LOOP_INTERVAL: float = _env("MAIN_LOOP_INTERVAL_SECONDS", 1.0, float)
+    TIER1_POLL_INTERVAL: float = _env("TIER1_POLL_INTERVAL_SECONDS", 2.0, float)
+    TIER2_POLL_INTERVAL: float = _env("TIER2_POLL_INTERVAL_SECONDS", 3.0, float)
+    TIER3_POLL_INTERVAL: float = _env("TIER3_POLL_INTERVAL_SECONDS", 12.0, float)
+    DISCOVERY_INTERVAL: float = _env("DISCOVERY_INTERVAL_SECONDS", 25.0, float)
+    TIER2_MAX_TOKENS: int = _env("TIER2_MAX_TOKENS", 30, int)
+    TIER3_MAX_TOKENS: int = _env("TIER3_MAX_TOKENS", 200, int)
+    API_RATE_LIMIT: int = _env("API_RATE_LIMIT_PER_MINUTE", 55, int)
+
+    # Discovery pre-filter (looser than entry filters)
+    DISCOVERY_MIN_LIQUIDITY: float = _env("DISCOVERY_MIN_LIQUIDITY_USD", 5000.0, float)
+    DISCOVERY_MIN_MCAP: float = _env("DISCOVERY_MIN_MCAP", 10000.0, float)
+    DISCOVERY_MAX_MCAP: float = _env("DISCOVERY_MAX_MCAP", 10000000.0, float)
+
+    # Tier 2 promotion thresholds (near entry filters)
+    HOT_MIN_VOLUME: float = _env("HOT_MIN_VOLUME_5M_USD", 200.0, float)
+    HOT_MIN_LIQUIDITY: float = _env("HOT_MIN_LIQUIDITY_USD", 15000.0, float)
+    HOT_MIN_MCAP: float = _env("HOT_MIN_MCAP", 40000.0, float)
+    HOT_MAX_MCAP: float = _env("HOT_MAX_MCAP", 2500000.0, float)
+    HOT_MIN_ACTIVITY: int = _env("HOT_MIN_ACTIVITY_TXNS", 2, int)
+
+    # Tier 3 demotion/removal thresholds
+    DEAD_TOKEN_ZERO_VOL_POLLS: int = _env("DEAD_TOKEN_ZERO_VOL_POLLS", 20, int)
+    DEAD_TOKEN_MIN_LIQUIDITY: float = _env("DEAD_TOKEN_MIN_LIQUIDITY_USD", 3000.0, float)
+    STALE_TOKEN_MAX_AGE_HOURS: float = _env("STALE_TOKEN_MAX_AGE_HOURS", 2.0, float)
+
     # ── Logging ───────────────────────────────────────────────
     LOG_LEVEL: str = _env("LOG_LEVEL", "DEBUG")
     LOG_FILE: str = _env("LOG_FILE", "logs/harvester.log")

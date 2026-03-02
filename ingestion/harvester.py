@@ -1,29 +1,28 @@
 """
 Data Ingestion Layer — DexScreener API + Solana RPC (for Gini).
-v2.0 — Bulk Fetching Optimization
-──────────────────────────────────
-Core change: replaces the sequential one-by-one token refresh loop with DexScreener's bulk endpoint:
-GET /latest/dex/tokens/{addr1},{addr2},...,{addr30}
+v3.1 — Tiered Polling Architecture
+────────────────────────────────────
+Replaces the flat 4-second cycle with a priority-based scheduler:
 
-This collapses up to 30 individual HTTP requests into ONE, cutting the refresh cycle
-from 30–90 seconds down to < 5 seconds.
+  Tier 1 — OPEN_POSITION (every 2s):  tokens with active trades
+  Tier 2 — HOT_WATCHLIST (every 3s):  pre-qualified entry candidates
+  Tier 3 — WARM_SCANNER  (every 12s): broader market monitoring (up to 200)
+  Tier 4 — DISCOVERY     (every 25s): new token discovery
 
-Architecture:
-1. Discovery phase: fetch boosted/trending tokens (unchanged).
-2. Staleness scan: identify tokens not updated in last 3 seconds.
-3. Chunk stale tokens into groups of 30.
-4. Single bulk request per chunk.
-5. For tokens with multiple pairs (Raydium, Orca, Meteora…), select the pair with the highest liquidity.usd.
-6. Prune tokens with no data for > 5 minutes.
+API budget: ~55 req/min (under 60 cap).
+Main loop interval: 1 second (was 4 seconds).
+
+Legacy poll() is preserved for backward compatibility.
 """
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Set
 import aiohttp
 import numpy as np
 import orjson
 from config.settings import Settings
+from ingestion.tiered_poller import TieredPoller, TrackedToken, TokenTier, TIER_CONFIGS
 from utils.logger import get_logger
 from utils.rate_limiter import AsyncRateLimiter
 
@@ -33,7 +32,7 @@ log = get_logger("Harvester")
 BULK_CHUNK_SIZE = 30           # DexScreener max per bulk request
 STALE_THRESHOLD_SECONDS = 3.0  # Token considered stale if older than this
 PRUNE_THRESHOLD_SECONDS = 300.0 # Remove token if no data for 5 minutes
-DISCOVERY_COOLDOWN_SECONDS = 15.0 # Don't re-discover too aggressively
+DISCOVERY_COOLDOWN_SECONDS = 15.0 # Don't re-discover too aggressively (legacy)
 
 # ── In-memory snapshot model ────────────────────────────────
 
@@ -125,6 +124,17 @@ class DataHarvester:
 
         # Performance counters (reset each poll for logging)
         self._poll_stats: dict[str, int] = {}
+
+        # ── Tiered polling scheduler (v3.1) ──────────────────
+        self.poller = TieredPoller(
+            tier1_interval=Settings.TIER1_POLL_INTERVAL,
+            tier2_interval=Settings.TIER2_POLL_INTERVAL,
+            tier3_interval=Settings.TIER3_POLL_INTERVAL,
+            discovery_interval=Settings.DISCOVERY_INTERVAL,
+            tier2_max_tokens=Settings.TIER2_MAX_TOKENS,
+            tier3_max_tokens=Settings.TIER3_MAX_TOKENS,
+            rate_limit_max=Settings.API_RATE_LIMIT,
+        )
 
     # ══════════════════════════════════════════════════════════
     # Session Management
@@ -521,6 +531,275 @@ class DataHarvester:
         )
         
         return total_ticks
+
+    # ══════════════════════════════════════════════════════════
+    # Tiered Polling (v3.1 — replaces flat poll() loop)
+    # ══════════════════════════════════════════════════════════
+
+    async def poll_tiered(self, open_position_mints: Optional[Set[str]] = None) -> int:
+        """
+        Execute one tiered polling task (called every ~1 second).
+        Picks the most-overdue tier and issues a single batch request.
+        Returns the number of ticks processed (0 if nothing was due).
+
+        Args:
+            open_position_mints: Set of mints with open trades, used for
+                                 tier promotion/demotion after the poll.
+        """
+        if open_position_mints is None:
+            open_position_mints = set()
+
+        task = self.poller.get_next_poll_task()
+        if task is None:
+            return 0
+
+        tier, mints = task
+
+        if tier == TokenTier.DISCOVERY:
+            added = await self._poll_discovery_tiered()
+            self.poller.last_discovery_time = time.time()
+            self.poller.record_request()
+            self._sync_tiered_to_legacy()
+            self.poller.update_token_tiers(
+                open_position_mints,
+                hot_min_volume=Settings.HOT_MIN_VOLUME,
+                hot_min_liquidity=Settings.HOT_MIN_LIQUIDITY,
+                hot_min_mcap=Settings.HOT_MIN_MCAP,
+                hot_max_mcap=Settings.HOT_MAX_MCAP,
+                hot_min_activity=Settings.HOT_MIN_ACTIVITY,
+                dead_zero_vol_polls=Settings.DEAD_TOKEN_ZERO_VOL_POLLS,
+                dead_min_liquidity=Settings.DEAD_TOKEN_MIN_LIQUIDITY,
+                stale_max_age_hours=Settings.STALE_TOKEN_MAX_AGE_HOURS,
+            )
+            log.debug(
+                f"Poll [DISCOVERY] │ {added} new tokens │ "
+                f"Budget: {self.poller._requests_in_window()}/"
+                f"{self.poller._rate_limit_max} │ "
+                f"Tiers: {self.poller.tier_counts()}"
+            )
+            return added
+
+        # Data-fetch tier (1, 2, or 3): batch request for specific tokens
+        if not mints:
+            return 0
+
+        # Map mints to pair addresses for DexScreener batch call
+        pair_addresses = []
+        mint_to_pair: dict[str, str] = {}
+        for mint in mints:
+            token = self.poller.tokens.get(mint)
+            if token and token.pair_address:
+                pair_addresses.append(token.pair_address)
+                mint_to_pair[token.pair_address] = mint
+
+        if not pair_addresses:
+            # Update poll timestamps even with no data to avoid tight-loops
+            now = time.time()
+            for mint in mints:
+                if mint in self.poller.tokens:
+                    self.poller.tokens[mint].last_poll_time = now
+            return 0
+
+        base = Settings.DEXSCREENER_BASE
+        joined = ",".join(pair_addresses[:BULK_CHUNK_SIZE])
+        url = f"{base}/latest/dex/pairs/solana/{joined}"
+        data = await self._fetch_json(url)
+        self.poller.record_request()
+
+        now = time.time()
+        ticks_processed = 0
+
+        if isinstance(data, dict):
+            all_pairs = data.get("pairs") or []
+            for pair in all_pairs:
+                pa = (pair.get("pairAddress") or "").strip()
+                mint = mint_to_pair.get(pa)
+                if not mint:
+                    # Try by base token address as fallback
+                    bt = pair.get("baseToken") or {}
+                    mint = (bt.get("address") or "").strip()
+
+                if not mint or mint not in self.poller.tokens:
+                    continue
+
+                token = self.poller.tokens[mint]
+                token.last_poll_time = now
+
+                tick = self._parse_tick(pair)
+                if tick is None:
+                    continue
+
+                # Update TrackedToken state
+                token.last_price = tick.price_usd
+                token.last_liquidity = tick.liquidity_usd
+                token.last_volume_5m = tick.volume_5m
+                token.last_mcap = tick.market_cap
+                token.last_buys_5m = tick.buys_5m
+                token.last_sells_5m = tick.sells_5m
+                token.last_tick_time = now
+
+                if tick.volume_5m < 1:
+                    token.consecutive_zero_vol += 1
+                else:
+                    token.consecutive_zero_vol = 0
+
+                # Keep the legacy TokenBuffer in sync
+                self._update_legacy_buffer(mint, token, pair, tick)
+                ticks_processed += 1
+
+        # Stamp all polled mints regardless of whether data was returned
+        for mint in mints:
+            if mint in self.poller.tokens:
+                self.poller.tokens[mint].last_poll_time = now
+
+        # Reclassify tiers after every poll
+        removed = self.poller.update_token_tiers(
+            open_position_mints,
+            hot_min_volume=Settings.HOT_MIN_VOLUME,
+            hot_min_liquidity=Settings.HOT_MIN_LIQUIDITY,
+            hot_min_mcap=Settings.HOT_MIN_MCAP,
+            hot_max_mcap=Settings.HOT_MAX_MCAP,
+            hot_min_activity=Settings.HOT_MIN_ACTIVITY,
+            dead_zero_vol_polls=Settings.DEAD_TOKEN_ZERO_VOL_POLLS,
+            dead_min_liquidity=Settings.DEAD_TOKEN_MIN_LIQUIDITY,
+            stale_max_age_hours=Settings.STALE_TOKEN_MAX_AGE_HOURS,
+        )
+        for mint in removed:
+            self.tokens.pop(mint, None)
+
+        log.debug(
+            f"Poll [{tier.name}] │ {len(mints)} tokens │ "
+            f"{ticks_processed} ticks │ "
+            f"Budget: {self.poller._requests_in_window()}/"
+            f"{self.poller._rate_limit_max} │ "
+            f"Tiers: {self.poller.tier_counts()}"
+        )
+        return ticks_processed
+
+    async def _poll_discovery_tiered(self) -> int:
+        """
+        Fetch newly listed/boosted tokens from DexScreener.
+        Add qualifying ones to Tier 3 (Warm Scanner).
+        Returns the number of new tokens added.
+        """
+        raw_pairs = await self._discover_tokens()
+        if not raw_pairs:
+            return 0
+
+        added = 0
+        rejected_reasons: dict[str, int] = {}
+        t3_cfg = self.poller._tier_configs[TokenTier.WARM_SCANNER]
+
+        for pair in raw_pairs:
+            ident = self._parse_identity(pair)
+            if not ident:
+                continue
+            mint, symbol, name, pa, dex = ident
+
+            # Skip already tracked
+            if mint in self.poller.tokens:
+                continue
+
+            liquidity = float((pair.get("liquidity") or {}).get("usd") or 0)
+            mcap = float(pair.get("marketCap") or pair.get("fdv") or 0)
+            volume_5m = float((pair.get("volume") or {}).get("m5") or 0)
+
+            if liquidity < Settings.DISCOVERY_MIN_LIQUIDITY:
+                rejected_reasons["low_liquidity"] = rejected_reasons.get("low_liquidity", 0) + 1
+                continue
+            if mcap < Settings.DISCOVERY_MIN_MCAP:
+                rejected_reasons["low_mcap"] = rejected_reasons.get("low_mcap", 0) + 1
+                continue
+            if mcap > Settings.DISCOVERY_MAX_MCAP:
+                rejected_reasons["high_mcap"] = rejected_reasons.get("high_mcap", 0) + 1
+                continue
+
+            # Check Tier 3 capacity
+            t3_count = sum(
+                1 for t in self.poller.tokens.values()
+                if t.tier == TokenTier.WARM_SCANNER
+            )
+            if t3_count >= t3_cfg.max_tokens:
+                rejected_reasons["scanner_full"] = rejected_reasons.get("scanner_full", 0) + 1
+                break
+
+            buys_5m = int((pair.get("txns") or {}).get("m5", {}).get("buys") or 0)
+            sells_5m = int((pair.get("txns") or {}).get("m5", {}).get("sells") or 0)
+            price = float(pair.get("priceUsd") or 0)
+
+            tracked = TrackedToken(
+                mint=mint,
+                symbol=symbol,
+                pair_address=pa,
+                tier=TokenTier.WARM_SCANNER,
+                last_poll_time=0.0,
+                last_price=price,
+                last_liquidity=liquidity,
+                last_volume_5m=volume_5m,
+                last_mcap=mcap,
+                last_buys_5m=buys_5m,
+                last_sells_5m=sells_5m,
+            )
+            self.poller.tokens[mint] = tracked
+
+            # Also seed the legacy TokenBuffer so analyzable_tokens() works
+            if mint not in self.tokens:
+                buf = TokenBuffer(
+                    mint=mint, symbol=symbol, name=name,
+                    pair_address=pa, dex_id=dex,
+                )
+                tick = self._parse_tick(pair)
+                if tick:
+                    buf.append(tick, Settings.ROLLING_WINDOW)
+                self.tokens[mint] = buf
+                self._discovery_total += 1
+
+            added += 1
+            log.info(
+                f"🆕 Discovered: {symbol} ({mint[:8]}…) │ "
+                f"${price:.10f} │ Liq ${liquidity:,.0f} │ "
+                f"Vol5m ${volume_5m:,.0f} │ DEX: {dex}"
+            )
+
+        if added > 0 or rejected_reasons:
+            log.info(
+                f"🔍 Discovery: {len(raw_pairs)} pairs found, "
+                f"{added} added to scanner, "
+                f"rejected: {rejected_reasons}"
+            )
+        return added
+
+    def _update_legacy_buffer(
+        self,
+        mint: str,
+        token: TrackedToken,
+        pair: dict,
+        tick: "Tick",
+    ):
+        """Keep the legacy TokenBuffer in sync with the TrackedToken."""
+        if mint not in self.tokens:
+            ident = self._parse_identity(pair)
+            if ident:
+                _, symbol, name, pa, dex = ident
+                self.tokens[mint] = TokenBuffer(
+                    mint=mint, symbol=symbol, name=name,
+                    pair_address=pa, dex_id=dex,
+                )
+        if mint in self.tokens:
+            buf = self.tokens[mint]
+            # Update pair_address if a higher-liquidity pool emerged
+            new_pa = (pair.get("pairAddress") or "").strip()
+            if new_pa and new_pa != buf.pair_address:
+                buf.pair_address = new_pa
+                buf.dex_id = pair.get("dexId") or buf.dex_id
+            buf.append(tick, Settings.ROLLING_WINDOW)
+
+    def _sync_tiered_to_legacy(self):
+        """Remove legacy buffers for tokens no longer tracked by the tiered poller."""
+        poller_mints = set(self.poller.tokens.keys())
+        stale = [m for m in list(self.tokens.keys()) if m not in poller_mints]
+        for mint in stale:
+            del self.tokens[mint]
 
     # ══════════════════════════════════════════════════════════
     # Accessors (unchanged interface for PaperTradingEngine)

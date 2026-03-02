@@ -60,7 +60,7 @@ async def main():
     await engine.initialize()
     
     log.info(
-        f"🚀 Engine ready. Polling every {Settings.POLL_INTERVAL}s. "
+        f"🚀 Engine ready. Polling every {Settings.MAIN_LOOP_INTERVAL}s (tiered). "
         f"Database: {Settings.DB_PATH}"
     )
     log.info(
@@ -128,9 +128,9 @@ async def main():
                 await asyncio.sleep(backoff)
                 continue
                 
-            # Sleep until next poll
+            # Sleep until next poll (target 1-second cycles)
             elapsed = time.time() - t0
-            sleep = max(0.0, Settings.POLL_INTERVAL - elapsed)
+            sleep = max(0.1, Settings.MAIN_LOOP_INTERVAL - elapsed)
             if sleep > 0:
                 await asyncio.sleep(sleep)
                 

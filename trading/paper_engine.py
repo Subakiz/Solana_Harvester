@@ -143,6 +143,19 @@ class PaperTradingEngine:
                     pair_address="",
                     dex_id="",
                 )
+
+            # Also register in the tiered poller as Tier 1
+            from ingestion.tiered_poller import TrackedToken, TokenTier
+            if pos.mint not in self.harvester.poller.tokens:
+                self.harvester.poller.tokens[pos.mint] = TrackedToken(
+                    mint=pos.mint,
+                    symbol=pos.symbol,
+                    pair_address="",
+                    tier=TokenTier.OPEN_POSITION,
+                )
+            else:
+                self.harvester.poller.promote_to_tier1(pos.mint)
+
             log.info(
                 f"♻️ Recovered open trade: {pos.trade_id} │ "
                 f"{pos.symbol} @ ${pos.entry_price:.10f}"
@@ -231,21 +244,24 @@ class PaperTradingEngine:
     # ══════════════════════════════════════════════════════════
 
     async def run_cycle(self):
-        """One complete paper-trading evaluation cycle."""
+        """One complete paper-trading evaluation cycle (tiered, ~1s cadence)."""
         self._cycle_count += 1
-        log.info(f"{'═' * 60}")
-        log.info(
-            f"🔄 PAPER CYCLE #{self._cycle_count} │ "
-            f"TP={self.optimizer.current_tp:.0%} ({self.optimizer.confidence}) │ "
-            f"Bal=${self.db.balance:,.2f}"
-        )
-        log.info(f"{'═' * 60}")
+
+        # Log full header only every 30 cycles to reduce noise at 1s intervals
+        if self._cycle_count % 30 == 1:
+            log.info(f"{'═' * 60}")
+            log.info(
+                f"🔄 PAPER CYCLE #{self._cycle_count} │ "
+                f"TP={self.optimizer.current_tp:.0%} ({self.optimizer.confidence}) │ "
+                f"Bal=${self.db.balance:,.2f}"
+            )
+            log.info(f"{'═' * 60}")
 
         # Reset day tracking if new UTC day
         self._check_day_reset()
 
         await self._maybe_reoptimize_tp()
-        await self._ingest()
+        await self._ingest_tiered()
         await self._manage_positions()
         await self._scan_entries()
 
@@ -256,8 +272,46 @@ class PaperTradingEngine:
             await self._print_report()
             self._last_report_time = time.time()
 
+        # Periodic tier-distribution summary (every 30 seconds)
+        now = time.time()
+        if int(now) % 30 == 0 and getattr(self, '_last_tier_log', 0) != int(now) // 30:
+            self._last_tier_log = int(now) // 30
+            open_mints = set(self.positions.keys())
+            tier_counts = self.harvester.poller.tier_counts()
+            budget = self.harvester.poller._requests_in_window()
+            log.info(
+                f"📊 Status │ Tracked: {len(self.harvester.tokens)} │ "
+                f"T1:{tier_counts.get('OPEN_POSITION', 0)} "
+                f"T2:{tier_counts.get('HOT_WATCHLIST', 0)} "
+                f"T3:{tier_counts.get('WARM_SCANNER', 0)} │ "
+                f"API: {budget}/min │ "
+                f"Open trades: {len(open_mints)}"
+            )
+
+    async def _ingest_tiered(self) -> int:
+        """
+        Run one tiered polling task and persist new ticks to SQLite.
+        Uses poll_tiered() with open-position awareness.
+        """
+        open_mints = set(self.positions.keys())
+        ticks_processed = await self.harvester.poll_tiered(open_mints)
+
+        # Persist only the ticks that were freshly updated this cycle
+        for mint, buf in self.harvester.tokens.items():
+            if buf.ticks:
+                t = buf.ticks[-1]
+                # Only persist if tick is recent (updated within last 2 seconds)
+                if time.time() - t.timestamp < 2.0:
+                    await self.db.insert_tick(
+                        mint=buf.mint, symbol=buf.symbol, price_usd=t.price_usd,
+                        liquidity_usd=t.liquidity_usd, volume_5m=t.volume_5m,
+                        buys_5m=t.buys_5m, sells_5m=t.sells_5m,
+                        market_cap=t.market_cap, pair_address=buf.pair_address,
+                    )
+        return ticks_processed
+
     async def _ingest(self) -> int:
-        """Poll DexScreener and persist every tick to SQLite."""
+        """Poll DexScreener and persist every tick to SQLite (legacy path)."""
         ticks_processed = await self.harvester.poll()
         for mint, buf in self.harvester.tokens.items():
             if buf.ticks:
@@ -709,6 +763,10 @@ class PaperTradingEngine:
             usd_size=usd_size, entry_liquidity=liquidity,
             was_size_capped=was_capped, last_tick_time=time.time(),
         )
+
+        # Promote to Tier 1 so the open position gets fast 2s polling
+        self.harvester.poller.promote_to_tier1(buf.mint)
+        log.info(f"📡 Promoted {buf.symbol} to TIER 1 (open position)")
 
     async def _get_gini(self, buf: TokenBuffer) -> Optional[float]:
         cached = self.harvester.get_cached_gini(buf.mint)

@@ -4,13 +4,14 @@
 ║     SOLANA MEME COIN DATA HARVESTER & PAPER TRADING ENGINE        ║
 ║                                                                   ║
 ║    Quantitative Models:                                           ║
-║    • Hurst Exponent (R/S) — Regime detection                      ║
-║    • Micro-CVD — Order-flow proxy                                 ║
-║    • Gini Coefficient — Rug-pull defense                          ║
+║    • Hurst Exponent (R/S) — Regime detection (logged, not gating) ║
+║    • Micro-CVD — Order-flow proxy (logged, not gating)            ║
+║    • Gini Coefficient — Rug-pull defense (logged, not gating)     ║
+║                                                                   ║
+║    Entry Filters: Volume, Liquidity, Market Cap, Buy Ratio        ║
+║    Exit: DYNAMIC_TP, RUG_PROTECTION (-50%), TIME_STOP (30min)     ║
 ║                                                                   ║
 ║    Output: SQLite database (quant_harvest.db)                     ║
-║    Tables: market_ticks, paper_trades, quant_signals              ║
-║                                                                   ║
 ║    NO LIVE TRADES — Paper simulation only.                        ║
 ╚═══════════════════════════════════════════════════════════════════╝
 """
@@ -40,7 +41,7 @@ async def main():
     # ── Banner ───────────────────────────────────────────────
     print()
     log.info("╔═══════════════════════════════════════════════════════════╗")
-    log.info("║   SOLANA DATA HARVESTER & PAPER TRADING ENGINE v1.0.0     ║")
+    log.info("║   SOLANA DATA HARVESTER & PAPER TRADING ENGINE v3.0.0     ║")
     log.info("╚═══════════════════════════════════════════════════════════╝")
     print()
     
@@ -63,13 +64,20 @@ async def main():
         f"Database: {Settings.DB_PATH}"
     )
     log.info(
-        f"🔢 Entry: H>{Settings.HURST_THRESHOLD} + bullish CVD + "
-        f"G<{Settings.MAX_GINI}"
+        f"📊 Entry Filters: Vol≥${Settings.MIN_VOLUME_5M:.0f} | "
+        f"Liq≥${Settings.MIN_LIQUIDITY:,.0f} | "
+        f"MCap ${Settings.MIN_MARKET_CAP:,.0f}-${Settings.MAX_MARKET_CAP:,.0f} | "
+        f"BuyR {Settings.MIN_BUY_RATIO:.0%}-{Settings.MAX_BUY_RATIO:.0%}"
     )
     log.info(
-        f"🛑 Exits: Hard={Settings.HARD_STOP_PCT:.0%} | "
-        f"Trail={Settings.TRAILING_STOP_PCT:.0%} | "
-        f"Time={Settings.TIME_STOP_MINUTES}min"
+        f"🛑 Exits: RugProtect={Settings.RUG_PROTECTION_PCT:.0%} | "
+        f"Time={Settings.TIME_STOP_MINUTES:.0f}min | "
+        f"DYNAMIC_TP"
+    )
+    log.info(
+        f"💰 Sizing: {Settings.POSITION_PCT:.0%} bal / "
+        f"{Settings.MAX_LIQUIDITY_PCT:.0%} liq | "
+        f"Max {Settings.MAX_OPEN_TRADES} positions"
     )
     print()
     
@@ -97,6 +105,15 @@ async def main():
                     f"💥 Cycle error ({consecutive_errors}/{max_errors}): {exc}",
                     exc_info=True,
                 )
+                # Log to system_events
+                try:
+                    await db.insert_system_event(
+                        event_type="CYCLE_ERROR", severity="ERROR",
+                        description=str(exc),
+                    )
+                except Exception:
+                    pass
+
                 if consecutive_errors >= max_errors:
                     log.critical(
                         f"⛔ {max_errors} consecutive errors — "
@@ -122,6 +139,12 @@ async def main():
     finally:
         log.info("🧹 Shutting down…")
         
+        # Graceful shutdown: close all open positions
+        try:
+            await engine.shutdown()
+        except Exception as e:
+            log.error(f"Error during engine shutdown: {e}")
+
         # Final report
         try:
             stats = await db.get_session_stats()
@@ -133,14 +156,6 @@ async def main():
                     log.info(f"  {k}: {v}")
         except Exception:
             pass
-            
-        # Warn about open positions
-        if engine.positions:
-            log.warning(
-                f"⚠️ {len(engine.positions)} paper positions still open:"
-            )
-            for mint, pos in engine.positions.items():
-                log.warning(f"  • {pos.symbol} ({pos.trade_id})")
                 
         await harvester.close()
         await db.close()

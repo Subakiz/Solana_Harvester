@@ -1,0 +1,8 @@
+config/
+db/
+logs/
+*.zip
+*.tar.gz
+__pycache__/
+.env
+data/*.db*

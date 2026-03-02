@@ -1,0 +1,6 @@
+# requirements_dashboard.txt
+streamlit==1.37.1
+streamlit-autorefresh==1.0.1
+plotly==5.22.0
+pandas==2.2.2
+numpy==1.26.4

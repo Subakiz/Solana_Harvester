@@ -1,0 +1,42 @@
+module.exports = {
+  apps: [
+    {
+      name: "solana-harvester",
+      script: ".venv/bin/python",
+      args: "main.py",
+      cwd: __dirname,
+      interpreter: "none",
+      autorestart: true,
+      watch: false,
+      max_memory_restart: "400M",
+      restart_delay: 5000,
+      max_restarts: 100,
+      min_uptime: "10s",
+      log_file: "./logs/pm2-harvester.log",
+      out_file: "./logs/pm2-harvester-out.log",
+      error_file: "./logs/pm2-harvester-err.log",
+      log_date_format: "YYYY-MM-DD HH:mm:ss.SSS",
+      env: {
+        PYTHONUNBUFFERED: "1",
+      },
+    },
+    {
+      name: "quant-dashboard",
+      script: ".venv/bin/streamlit",
+      args: "run dashboard.py --server.port 8501 --server.headless true --server.address 0.0.0.0 --browser.gatherUsageStats false",
+      cwd: __dirname,
+      interpreter: "none",
+      autorestart: true,
+      watch: false,
+      max_memory_restart: "300M",
+      restart_delay: 3000,
+      log_file: "./logs/pm2-dashboard.log",
+      out_file: "./logs/pm2-dashboard-out.log",
+      error_file: "./logs/pm2-dashboard-err.log",
+      log_date_format: "YYYY-MM-DD HH:mm:ss.SSS",
+      env: {
+        PYTHONUNBUFFERED: "1",
+      },
+    },
+  ],
+};

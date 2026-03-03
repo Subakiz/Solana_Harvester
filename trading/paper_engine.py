@@ -6,7 +6,7 @@ Changes from v2.0:
 - Trailing stop REMOVED (6.4% win rate, -$28M losses)
 - Hard stop REMOVED → replaced by rug protection at -50%
 - Entry filters: volume, liquidity, market cap, buy ratio, activity
-- Hurst/CVD/Gini demoted from gates to logging only
+- Hurst/CVD/Gini promoted to entry gates (skipped if data unavailable)
 - Liquidity-aware position sizing with cost model
 - Risk management: circuit breaker, cooldown, position limits
 - Data staleness handling (60s/120s/180s staged)
@@ -611,28 +611,18 @@ class PaperTradingEngine:
         analyzable = self.harvester.analyzable_tokens()
         log.info(f"🔬 Scanning {len(analyzable)} tokens for entry signals…")
 
+        # Check max positions BEFORE iterating tokens
+        if len(self.positions) >= Settings.MAX_OPEN_TRADES:
+            log.info(
+                f"  ⛔ Max open trades ({Settings.MAX_OPEN_TRADES}) — skipping scan"
+            )
+            return
+
         for buf in analyzable:
             if buf.mint in self.positions:
                 continue
             if await self.db.is_mint_in_open_trade(buf.mint):
                 continue
-
-            # Max concurrent positions
-            if len(self.positions) >= Settings.MAX_OPEN_TRADES:
-                log.info(
-                    f"  ⛔ Max open trades ({Settings.MAX_OPEN_TRADES}) — "
-                    f"skipping scan"
-                )
-                await self.db.insert_filter_rejection(
-                    mint=buf.mint, symbol=buf.symbol,
-                    rejection_reason=f"MAX_POSITIONS_REACHED (open={len(self.positions)}, max={Settings.MAX_OPEN_TRADES})",
-                    price_usd=buf.latest_price,
-                )
-                await self.db.insert_system_event(
-                    event_type="MAX_POSITIONS_BLOCKED", severity="INFO",
-                    description=f"Entry rejected for {buf.symbol}: max positions reached",
-                )
-                return
 
             # Check data block
             if buf.mint in self._data_blocked_tokens:
@@ -650,12 +640,15 @@ class PaperTradingEngine:
     async def _evaluate_entry(self, buf: TokenBuffer):
         """
         Entry filter chain (fastest rejections first):
-        1. Activity check: buys + sells >= 3
-        2. Liquidity check: liquidity >= 20,000
-        3. Volume check: volume_5m >= 500
-        4. Market cap check: 50K <= mcap <= 2M
-        5. Buy ratio check: 0.40 <= ratio <= 0.75
-        6. Calculate Hurst/CVD/Gini (for LOGGING only, not gating)
+        1. Activity check: buys + sells >= MIN_ACTIVITY_TXNS
+        2. Liquidity check: liquidity >= MIN_LIQUIDITY
+        3. Volume check: volume_5m >= MIN_VOLUME_5M
+        4. Market cap check: MIN_MARKET_CAP <= mcap <= MAX_MARKET_CAP
+        5. Buy ratio check: MIN_BUY_RATIO <= ratio <= MAX_BUY_RATIO
+        6. Quant signal gates (skipped if data unavailable):
+           6a. Hurst exponent >= HURST_THRESHOLD
+           6b. Gini coefficient <= MAX_GINI
+           6c. CVD slope within MIN_CVD_SLOPE..MAX_CVD_SLOPE
         7. Position sizing check
         8. ENTER TRADE
         """
@@ -728,7 +721,7 @@ class PaperTradingEngine:
             )
             return
 
-        # ── 6. Calculate Hurst/CVD/Gini (logging only, NOT gating) ──
+        # ── 6. Calculate Hurst/CVD/Gini and apply entry gates ──
         H = hurst_exponent(buf.prices)
         cvd_val, cvd_slope, is_bullish = micro_cvd(
             buf.buys, buf.sells, buf.volumes, buf.prices,
@@ -736,8 +729,53 @@ class PaperTradingEngine:
         )
         gini = await self._get_gini(buf)
 
+        # ── 6a. Hurst gate ───────────────────────────────────
+        if H is None:
+            log.debug(f"  ℹ️ {buf.symbol}: Hurst data insufficient — skipping gate")
+        elif H < Settings.HURST_THRESHOLD:
+            reason = f"HURST_TOO_LOW (H={H:.4f}, min={Settings.HURST_THRESHOLD})"
+            log.debug(f"  ❌ {buf.symbol}: {reason}")
+            await self.db.insert_filter_rejection(
+                mint=buf.mint, symbol=buf.symbol, rejection_reason=reason,
+                price_usd=price, liquidity_usd=liquidity, volume_5m=volume,
+                buys_5m=buys, sells_5m=sells, market_cap=mcap,
+                buy_ratio=buy_ratio, hurst_value=H,
+                cvd_slope=cvd_slope or 0.0, gini_coeff=gini or 0.0,
+            )
+            return
+
+        # ── 6b. Gini gate ────────────────────────────────────
+        if gini is None:
+            log.debug(f"  ℹ️ {buf.symbol}: Gini data unavailable — skipping gate")
+        elif gini > Settings.MAX_GINI:
+            reason = f"GINI_TOO_HIGH (G={gini:.4f}, max={Settings.MAX_GINI})"
+            log.debug(f"  ❌ {buf.symbol}: {reason}")
+            await self.db.insert_filter_rejection(
+                mint=buf.mint, symbol=buf.symbol, rejection_reason=reason,
+                price_usd=price, liquidity_usd=liquidity, volume_5m=volume,
+                buys_5m=buys, sells_5m=sells, market_cap=mcap,
+                buy_ratio=buy_ratio, hurst_value=H or 0.0,
+                cvd_slope=cvd_slope or 0.0, gini_coeff=gini,
+            )
+            return
+
+        # ── 6c. CVD slope gate ───────────────────────────────
+        if cvd_slope is None:
+            log.debug(f"  ℹ️ {buf.symbol}: CVD slope data unavailable — skipping gate")
+        elif cvd_slope < Settings.MIN_CVD_SLOPE or cvd_slope > Settings.MAX_CVD_SLOPE:
+            reason = f"CVD_SLOPE_OUT_OF_RANGE (slope={cvd_slope:.4f}, range={Settings.MIN_CVD_SLOPE}-{Settings.MAX_CVD_SLOPE})"
+            log.debug(f"  ❌ {buf.symbol}: {reason}")
+            await self.db.insert_filter_rejection(
+                mint=buf.mint, symbol=buf.symbol, rejection_reason=reason,
+                price_usd=price, liquidity_usd=liquidity, volume_5m=volume,
+                buys_5m=buys, sells_5m=sells, market_cap=mcap,
+                buy_ratio=buy_ratio, hurst_value=H or 0.0,
+                cvd_slope=cvd_slope, gini_coeff=gini or 0.0,
+            )
+            return
+
         log.info(
-            f"  📈 {buf.symbol}: Filters PASSED │ "
+            f"  📈 {buf.symbol}: All filters PASSED │ "
             f"Vol=${volume:,.0f} Liq=${liquidity:,.0f} MCap=${mcap:,.0f} "
             f"BuyR={buy_ratio:.2f} │ "
             f"H={H or 0:.4f} CVD={cvd_slope or 0:.4f} G={gini or 0:.4f}"

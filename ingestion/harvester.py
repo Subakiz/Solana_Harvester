@@ -704,6 +704,13 @@ class DataHarvester:
                 rejected_reasons["wrong_chain"] = rejected_reasons.get("wrong_chain", 0) + 1
                 continue
 
+            # Check for skipped symbols (SOL, USDC, etc.) before identity parsing
+            bt = pair.get("baseToken") or {}
+            symbol_raw = (bt.get("symbol") or "").strip().upper()
+            if symbol_raw in self._SKIP_SYMBOLS:
+                rejected_reasons["skipped_symbol"] = rejected_reasons.get("skipped_symbol", 0) + 1
+                continue
+
             ident = self._parse_identity(pair)
             if not ident:
                 # Distinguish no mint vs no pair address

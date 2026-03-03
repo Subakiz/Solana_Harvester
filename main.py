@@ -4,9 +4,9 @@
 ║     SOLANA MEME COIN DATA HARVESTER & PAPER TRADING ENGINE        ║
 ║                                                                   ║
 ║    Quantitative Models:                                           ║
-║    • Hurst Exponent (R/S) — Regime detection (logged, not gating) ║
-║    • Micro-CVD — Order-flow proxy (logged, not gating)            ║
-║    • Gini Coefficient — Rug-pull defense (logged, not gating)     ║
+║    • Hurst Exponent (R/S) — Regime detection (entry gate ≥0.70)   ║
+║    • Micro-CVD — Order-flow proxy (entry gate 10–2000)            ║
+║    • Gini Coefficient — Rug-pull defense (entry gate ≤0.35)       ║
 ║                                                                   ║
 ║    Entry Filters: Volume, Liquidity, Market Cap, Buy Ratio        ║
 ║    Exit: DYNAMIC_TP, RUG_PROTECTION (-50%), TIME_STOP (30min)     ║
@@ -41,7 +41,7 @@ async def main():
     # ── Banner ───────────────────────────────────────────────
     print()
     log.info("╔═══════════════════════════════════════════════════════════╗")
-    log.info("║   SOLANA DATA HARVESTER & PAPER TRADING ENGINE v3.0.0     ║")
+    log.info("║   SOLANA DATA HARVESTER & PAPER TRADING ENGINE v4.0.0     ║")
     log.info("╚═══════════════════════════════════════════════════════════╝")
     print()
     
@@ -68,6 +68,11 @@ async def main():
         f"Liq≥${Settings.MIN_LIQUIDITY:,.0f} | "
         f"MCap ${Settings.MIN_MARKET_CAP:,.0f}-${Settings.MAX_MARKET_CAP:,.0f} | "
         f"BuyR {Settings.MIN_BUY_RATIO:.0%}-{Settings.MAX_BUY_RATIO:.0%}"
+    )
+    log.info(
+        f"🧮 Quant Gates: Hurst≥{Settings.HURST_THRESHOLD} | "
+        f"Gini≤{Settings.MAX_GINI} | "
+        f"CVD {Settings.MIN_CVD_SLOPE}–{Settings.MAX_CVD_SLOPE}"
     )
     log.info(
         f"🛑 Exits: RugProtect={Settings.RUG_PROTECTION_PCT:.0%} | "

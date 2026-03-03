@@ -35,15 +35,17 @@ class Settings:
     POLL_INTERVAL: float = _env("POLL_INTERVAL_SECONDS", 4.0, float)
     ROLLING_WINDOW: int = _env("ROLLING_WINDOW_SIZE", 50, int)
 
-    # ── Quant thresholds (kept for calculation, NOT used as gates) ──
-    HURST_THRESHOLD: float = _env("HURST_THRESHOLD", 0.6, float)
-    MAX_GINI: float = _env("MAX_GINI_COEFFICIENT", 0.85, float)
+    # ── Quant signal gates (used as entry filters when data is available) ──
+    HURST_THRESHOLD: float = _env("HURST_THRESHOLD", 0.70, float)
+    MAX_GINI: float = _env("MAX_GINI_COEFFICIENT", 0.35, float)
+    MIN_CVD_SLOPE: float = _env("MIN_CVD_SLOPE", 10.0, float)
+    MAX_CVD_SLOPE: float = _env("MAX_CVD_SLOPE", 2000.0, float)
     CVD_LOOKBACK: int = _env("CVD_LOOKBACK_PERIODS", 10, int)
     MIN_SNAPSHOTS_HURST: int = _env("MIN_SNAPSHOTS_HURST", 20, int)
 
     # ── Entry Filters ─────────────────────────────────────────
     MIN_VOLUME_5M: float = _env("MIN_VOLUME_5M_USD", 500.0, float)
-    MIN_LIQUIDITY: float = _env("MIN_LIQUIDITY_USD", 20000.0, float)
+    MIN_LIQUIDITY: float = _env("MIN_LIQUIDITY_USD", 50000.0, float)
     MIN_MARKET_CAP: float = _env("MIN_MARKET_CAP", 50000.0, float)
     MAX_MARKET_CAP: float = _env("MAX_MARKET_CAP", 2000000.0, float)
     MIN_BUY_RATIO: float = _env("MIN_BUY_RATIO", 0.40, float)
@@ -138,6 +140,7 @@ class Settings:
             "Time stop": f"{cls.TIME_STOP_MINUTES:.0f}min",
             "Position": f"{cls.POSITION_PCT:.0%} bal / {cls.MAX_LIQUIDITY_PCT:.0%} liq",
             "Max open": str(cls.MAX_OPEN_TRADES),
-            "Hurst (log)": f">{cls.HURST_THRESHOLD}",
-            "Gini (log)": f"<{cls.MAX_GINI}",
+            "Hurst gate": f"≥{cls.HURST_THRESHOLD}",
+            "Gini gate": f"≤{cls.MAX_GINI}",
+            "CVD slope": f"{cls.MIN_CVD_SLOPE}–{cls.MAX_CVD_SLOPE}",
         }

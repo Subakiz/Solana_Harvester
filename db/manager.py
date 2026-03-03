@@ -264,6 +264,10 @@ class DatabaseManager:
     def balance(self) -> float:
         return self._balance
 
+    def adjust_balance(self, amount: float):
+        """Adjust the in-memory balance by the given amount."""
+        self._balance += amount
+
     # ══════════════════════════════════════════════════════════
     # Market Ticks
     # ══════════════════════════════════════════════════════════

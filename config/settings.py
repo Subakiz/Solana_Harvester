@@ -84,8 +84,11 @@ class Settings:
     LOSS_COOLDOWN_MINUTES: float = _env("LOSS_COOLDOWN_MINUTES", 5.0, float)
 
     # ── Cost Model (paper trading accuracy) ───────────────────
+    # Jupiter/Raydium charges ~0.5% with platform fees (was 0.3%)
     FEE_PER_SIDE_PCT: float = _env("FEE_PER_SIDE_PCT", 0.005, float)
+    # Meme coin AMM curves amplify slippage vs size (was 0.5)
     SLIPPAGE_FACTOR: float = _env("SLIPPAGE_FACTOR", 5.0, float)
+    # Thin meme coin order books can slip 3%+ on larger trades (was 0.25%)
     MAX_SLIPPAGE_PCT: float = _env("MAX_SLIPPAGE_PCT", 3.0, float)
     BASE_SLIPPAGE_PCT: float = _env("BASE_SLIPPAGE_PCT", 0.01, float)
     PRIORITY_FEE_USD: float = _env("PRIORITY_FEE_USD", 0.05, float)

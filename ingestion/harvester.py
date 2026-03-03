@@ -368,7 +368,7 @@ class DataHarvester:
 
         log.debug(
             f" Discovery sources: {len(solana_pairs)} unique pairs "
-            f"(dedup from {len(seen_mints)} mints)"
+            f"(deduped to {len(seen_mints)} unique mints)"
         )
         return solana_pairs
 

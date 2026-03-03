@@ -486,10 +486,8 @@ class PaperTradingEngine:
 
             # 1. Dynamic Take Profit (MFE-Optimized)
             if gain >= self.optimizer.current_tp:
-                if Settings.PARTIAL_TP_SELL_PCT >= 1.0:
-                    return f"DYNAMIC_TP (+{gain * 100:.1f}% gain)"
-                else:
-                    return f"PARTIAL_TP (+{gain * 100:.1f}% gain)"
+                reason_tag = "DYNAMIC_TP" if Settings.PARTIAL_TP_SELL_PCT >= 1.0 else "PARTIAL_TP"
+                return f"{reason_tag} (+{gain * 100:.1f}% gain)"
 
             # 2. Rug Protection (checked before partial stop — more severe)
             if gain <= Settings.RUG_PROTECTION_PCT:
@@ -576,7 +574,7 @@ class PaperTradingEngine:
 
             # Credit balance
             balance_before = self.db.balance
-            self.db._balance += net_usd_pnl
+            self.db.adjust_balance(net_usd_pnl)
 
             # Record partial exit in portfolio_state
             desc = (

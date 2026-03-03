@@ -220,6 +220,8 @@ class DatabaseManager:
             ("entry_volume_5m", "REAL"),
             ("entry_market_cap", "REAL"),
             ("entry_buy_ratio", "REAL"),
+            ("partial_tp_taken", "INTEGER DEFAULT 0"),
+            ("trail_active", "INTEGER DEFAULT 0"),
         ]
         for col_name, col_type in new_cols:
             try:
@@ -346,14 +348,16 @@ class DatabaseManager:
             if cost_info:
                 fee_pct = cost_info.get("fee_pct", 0.0)
                 slippage_pct = cost_info.get("slippage_pct", 0.0)
+                priority_fee_usd = cost_info.get("priority_fee_usd", 0.0)
                 net_pnl_pct = raw_pnl_pct - fee_pct - slippage_pct
             else:
                 fee_pct = 0.0
                 slippage_pct = 0.0
+                priority_fee_usd = 0.0
                 net_pnl_pct = raw_pnl_pct
 
             raw_usd_pnl = usd_size * raw_pnl_pct
-            net_usd_pnl = usd_size * net_pnl_pct
+            net_usd_pnl = usd_size * net_pnl_pct - priority_fee_usd
 
             # Update trade record
             await self._db.execute(
@@ -747,6 +751,97 @@ class DatabaseManager:
             return row["balance_after"] if row else self._balance
         except Exception:
             return self._balance
+
+    # ══════════════════════════════════════════════════════════
+    # Portfolio Events (v4.1 — for partial exits)
+    # ══════════════════════════════════════════════════════════
+
+    async def insert_portfolio_event(self, *, event_type: str, trade_id: str,
+                                     balance_before: float, balance_after: float,
+                                     usd_change: float, description: str):
+        """Insert a portfolio state event (used for partial exits, etc.)."""
+        try:
+            await self._db.execute(
+                """INSERT INTO portfolio_state
+                   (timestamp, event_type, trade_id, balance_before,
+                    balance_after, usd_change, description)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (time.time(), event_type, trade_id, balance_before,
+                 balance_after, usd_change, description),
+            )
+            await self._db.commit()
+        except Exception as exc:
+            log.error(f"insert_portfolio_event error: {exc}")
+            await self._db.rollback()
+
+    # ══════════════════════════════════════════════════════════
+    # Extended Stats (v4.1 — for enhanced reporting)
+    # ══════════════════════════════════════════════════════════
+
+    async def get_extended_stats(self) -> Optional[dict]:
+        """Get extended performance metrics: payoff ratio, profit factor, expectancy, avg hold time."""
+        try:
+            cursor = await self._db.execute(
+                """SELECT net_pnl_pct, net_usd_pnl, entry_time, exit_time
+                   FROM paper_trades WHERE status='CLOSED'"""
+            )
+            trades = await cursor.fetchall()
+            if not trades:
+                return None
+
+            wins = [t for t in trades if (t["net_pnl_pct"] or 0) > 0]
+            losses = [t for t in trades if (t["net_pnl_pct"] or 0) < 0]
+
+            avg_win = sum(t["net_pnl_pct"] or 0 for t in wins) / len(wins) if wins else 0.0
+            avg_loss = abs(sum(t["net_pnl_pct"] or 0 for t in losses) / len(losses)) if losses else 0.0
+            payoff_ratio = (avg_win / avg_loss) if avg_loss > 0 else 0.0
+
+            gross_profit = sum(t["net_usd_pnl"] or 0 for t in wins)
+            gross_loss = abs(sum(t["net_usd_pnl"] or 0 for t in losses))
+            profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 0.0
+
+            n = len(trades)
+            win_rate = len(wins) / n if n > 0 else 0.0
+            loss_rate = len(losses) / n if n > 0 else 0.0
+            expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
+
+            hold_times = []
+            for t in trades:
+                if t["entry_time"] and t["exit_time"]:
+                    hold_times.append((t["exit_time"] - t["entry_time"]) / 60.0)
+            avg_hold = sum(hold_times) / len(hold_times) if hold_times else 0.0
+
+            return {
+                "payoff_ratio": payoff_ratio,
+                "profit_factor": profit_factor,
+                "expectancy": expectancy,
+                "avg_hold_minutes": avg_hold,
+            }
+        except Exception as exc:
+            log.error(f"get_extended_stats error: {exc}")
+            return None
+
+    async def get_filter_rejection_counts(self, since: float) -> dict:
+        """Get counts of filter rejections by reason prefix since a timestamp."""
+        try:
+            result = {}
+            for prefix in [
+                "ACTIVITY_TOO_LOW", "LIQUIDITY_TOO_LOW", "VOLUME_TOO_LOW",
+                "MCAP_OUT_OF_RANGE", "BUY_RATIO_OUT_OF_RANGE",
+                "MOMENTUM_SMA_FAIL", "MOMENTUM_DELTA_FAIL",
+                "HURST_TOO_LOW", "GINI_TOO_HIGH", "CVD_SLOPE_OUT_OF_RANGE",
+            ]:
+                cursor = await self._db.execute(
+                    """SELECT COUNT(*) as cnt FROM filter_rejections
+                       WHERE timestamp >= ? AND rejection_reason LIKE ?""",
+                    (since, f"{prefix}%"),
+                )
+                row = await cursor.fetchone()
+                result[prefix] = row["cnt"] if row else 0
+            return result
+        except Exception as exc:
+            log.error(f"get_filter_rejection_counts error: {exc}")
+            return {}
 
     # ══════════════════════════════════════════════════════════
     # Session Stats (for reporting)

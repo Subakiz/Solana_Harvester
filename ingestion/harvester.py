@@ -291,6 +291,8 @@ class DataHarvester:
         Returns raw pair dicts for parsing.
         Rate-limited and throttled to avoid excessive API calls:
         runs at most once every DISCOVERY_COOLDOWN_SECONDS.
+
+        v4.1: Added latest pairs and token profiles endpoints.
         """
         now = time.time()
         if now - self._last_discovery_time < DISCOVERY_COOLDOWN_SECONDS:
@@ -300,6 +302,19 @@ class DataHarvester:
         self._last_discovery_time = now
         base = Settings.DEXSCREENER_BASE
         solana_pairs: list[dict] = []
+        seen_mints: set[str] = set()
+
+        def _dedup_add(pairs: list[dict], source: str):
+            """Add pairs, deduplicating by mint address."""
+            for p in pairs:
+                if p.get("chainId") != "solana":
+                    continue
+                bt = p.get("baseToken") or {}
+                mint = (bt.get("address") or "").strip()
+                if mint and mint not in seen_mints:
+                    seen_mints.add(mint)
+                    p["_discovery_source"] = source
+                    solana_pairs.append(p)
         
         # ── Endpoint 1: Boosted tokens ───────────────────
         boosts = await self._fetch_json(f"{base}/token-boosts/top/v1")
@@ -318,17 +333,43 @@ class DataHarvester:
                 url = f"{base}/latest/dex/tokens/{joined}"
                 data = await self._fetch_json(url)
                 if isinstance(data, dict):
-                    for p in data.get("pairs") or []:
-                        if p.get("chainId") == "solana":
-                            solana_pairs.append(p)
+                    _dedup_add(data.get("pairs") or [], "boosted")
         
         # ── Endpoint 2: Search fallback ──────────────────
         search = await self._fetch_json(f"{base}/latest/dex/search?q=SOL")
         if isinstance(search, dict):
-            for p in search.get("pairs") or []:
-                if p.get("chainId") == "solana":
-                    solana_pairs.append(p)
-                    
+            _dedup_add(search.get("pairs") or [], "search")
+
+        # ── Endpoint 3: Latest pairs (v4.1) ──────────────
+        if Settings.DISCOVERY_ENABLE_LATEST_PAIRS:
+            latest = await self._fetch_json(f"{base}/latest/dex/pairs/solana")
+            if isinstance(latest, dict):
+                _dedup_add(latest.get("pairs") or [], "latest_pairs")
+            elif isinstance(latest, list):
+                _dedup_add(latest, "latest_pairs")
+
+        # ── Endpoint 4: Token profiles (v4.1) ────────────
+        if Settings.DISCOVERY_ENABLE_PROFILES:
+            profiles = await self._fetch_json(f"{base}/token-profiles/latest/v1")
+            if isinstance(profiles, list):
+                profile_addrs: list[str] = []
+                for item in profiles:
+                    if item.get("chainId") == "solana" and item.get("tokenAddress"):
+                        addr = item["tokenAddress"].strip()
+                        if addr and addr not in profile_addrs and addr not in seen_mints:
+                            profile_addrs.append(addr)
+                # Bulk-fetch profile tokens
+                for chunk in _chunk_list(profile_addrs, BULK_CHUNK_SIZE):
+                    joined = ",".join(chunk)
+                    url = f"{base}/latest/dex/tokens/{joined}"
+                    data = await self._fetch_json(url)
+                    if isinstance(data, dict):
+                        _dedup_add(data.get("pairs") or [], "profiles")
+
+        log.debug(
+            f" Discovery sources: {len(solana_pairs)} unique pairs "
+            f"(dedup from {len(seen_mints)} mints)"
+        )
         return solana_pairs
 
     # ══════════════════════════════════════════════════════════

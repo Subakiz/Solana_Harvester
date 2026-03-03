@@ -1,16 +1,15 @@
 """
 Paper Trading Simulation Engine.
-v3.0 — Complete Refactor: Statistical Edge Optimization
+v4.1 — Comprehensive Upgrade: Scaled Exits, Realistic Costs, Momentum Filter
 ────────────────────────────────────────────────────────
-Changes from v2.0:
-- Trailing stop REMOVED (6.4% win rate, -$28M losses)
-- Hard stop REMOVED → replaced by rug protection at -50%
-- Entry filters: volume, liquidity, market cap, buy ratio, activity
-- Hurst/CVD/Gini promoted to entry gates (skipped if data unavailable)
-- Liquidity-aware position sizing with cost model
-- Risk management: circuit breaker, cooldown, position limits
-- Data staleness handling (60s/120s/180s staged)
-- Hourly performance snapshots
+Changes from v3.0:
+- Scaled exit system: partial TP + trailing stop on remainder
+- Realistic cost model: base slippage floor + priority fees
+- Per-token re-entry cooldown
+- Momentum confirmation filter (SMA + price delta)
+- Tighter default stop loss (-15%) + partial stop loss tier
+- Extended rolling window (80) and Hurst tuning (min 15)
+- Enhanced performance reporting (payoff ratio, profit factor, etc.)
 """
 import asyncio
 import json
@@ -58,6 +57,12 @@ class LivePaperPosition:
     last_tick_time: float = 0.0  # Track data freshness
     data_stale_warned: bool = False
     data_stale_error: bool = False
+    # ── Scaled exit state (v4.1) ─────────────────────────
+    partial_tp_taken: bool = False
+    original_usd_size: float = 0.0
+    trail_active: bool = False
+    trail_peak: float = 0.0
+    partial_stop_taken: bool = False
 
 
 @dataclass
@@ -108,6 +113,9 @@ class PaperTradingEngine:
 
         # ── Data staleness: tokens blocked after DATA_TIMEOUT ─
         self._data_blocked_tokens: dict[str, float] = {}  # mint -> resume_after_ts
+
+        # ── Trade cooldown: tokens blocked after trade exit (v4.1) ─
+        self._trade_cooldown_tokens: dict[str, float] = {}  # mint -> resume_after_ts
 
         # ── Hourly snapshots ─────────────────────────────────
         self._last_snapshot_time: float = time.time()
@@ -454,11 +462,18 @@ class PaperTradingEngine:
 
     def _check_exits(self, pos: LivePaperPosition, price: float) -> Optional[str]:
         """
-        Evaluate exit conditions. Order:
-        1. DYNAMIC_TP (MFE-Optimized) — kept exactly as-is
-        2. RUG_PROTECTION at -50% — replaces hard stop
-        3. TIME_STOP at 30 minutes — kept exactly as-is
-        (Trailing stop REMOVED, hard stop REMOVED)
+        Evaluate exit conditions (v4.1 — Scaled Exit System).
+
+        Before partial TP:
+          1. DYNAMIC_TP → partial sell (or full sell if PARTIAL_TP_SELL_PCT=1.0)
+          2. PARTIAL_STOP_LOSS → partial sell at moderate drawdown
+          3. RUG_PROTECTION → full sell at severe loss
+          4. TIME_STOP at TIME_STOP_MINUTES
+        After partial TP (trailing phase):
+          1. MAX_GAIN → force full exit (anti-greed)
+          2. TRAILING_STOP → trailing from peak high
+          3. RUG_PROTECTION → still active
+          4. MAX_POSITION_TIME_MINUTES → extended time stop
         """
         ep = pos.entry_price
         if ep <= 0:
@@ -466,63 +481,175 @@ class PaperTradingEngine:
 
         gain = (price - ep) / ep
 
-        # 1. Dynamic Take Profit (MFE-Optimized) — PRESERVED
-        if gain >= self.optimizer.current_tp:
-            return f"DYNAMIC_TP (+{gain * 100:.1f}% gain)"
+        if not pos.partial_tp_taken:
+            # ── Phase 1: Pre-partial-TP ──────────────────────
 
-        # 2. Rug Protection: price drops 50% from entry
-        if gain <= Settings.RUG_PROTECTION_PCT:
-            log.warning(
-                f"⚠️ RUG_PROTECTION triggered for {pos.symbol}: "
-                f"{gain * 100:.1f}% loss — entry filters may have failed"
-            )
-            return f"RUG_PROTECTION (-{abs(gain) * 100:.1f}% from entry)"
+            # 1. Dynamic Take Profit (MFE-Optimized)
+            if gain >= self.optimizer.current_tp:
+                if Settings.PARTIAL_TP_SELL_PCT >= 1.0:
+                    return f"DYNAMIC_TP (+{gain * 100:.1f}% gain)"
+                else:
+                    return f"PARTIAL_TP (+{gain * 100:.1f}% gain)"
 
-        # 3. Time stop: trade open longer than 30 minutes
-        age = time.time() - pos.entry_time
-        if age >= Settings.TIME_STOP_SECONDS:
-            return f"TIME_STOP ({age / 60:.1f} min)"
+            # 2. Rug Protection (checked before partial stop — more severe)
+            if gain <= Settings.RUG_PROTECTION_PCT:
+                log.warning(
+                    f"⚠️ RUG_PROTECTION triggered for {pos.symbol}: "
+                    f"{gain * 100:.1f}% loss — entry filters may have failed"
+                )
+                return f"RUG_PROTECTION (-{abs(gain) * 100:.1f}% from entry)"
+
+            # 3. Partial stop loss — moderate drawdown
+            if not pos.partial_stop_taken and gain <= Settings.PARTIAL_STOP_LOSS_PCT:
+                return f"PARTIAL_STOP_LOSS ({gain * 100:.1f}% loss)"
+
+            # 4. Time stop
+            age = time.time() - pos.entry_time
+            if age >= Settings.TIME_STOP_SECONDS:
+                return f"TIME_STOP ({age / 60:.1f} min)"
+        else:
+            # ── Phase 2: Post-partial-TP (trailing stop phase) ──
+
+            # 1. Max gain cap (anti-greed)
+            if gain >= Settings.MAX_GAIN_PCT:
+                return f"MAX_GAIN_CAP (+{gain * 100:.1f}% gain)"
+
+            # 2. Trailing stop
+            if pos.trail_active:
+                trail_drop = (pos.trail_peak - price) / pos.trail_peak if pos.trail_peak > 0 else 0
+                if trail_drop >= Settings.TRAILING_STOP_PCT:
+                    return f"TRAILING_STOP (-{trail_drop * 100:.1f}% from peak ${pos.trail_peak:.10f})"
+            else:
+                # Activate trailing stop once gain exceeds activation threshold
+                if gain >= Settings.TRAILING_ACTIVATION_PCT:
+                    pos.trail_active = True
+                    pos.trail_peak = price
+                    log.info(
+                        f"📈 TRAIL ACTIVATED for {pos.symbol}: "
+                        f"gain={gain:+.1%}, peak=${price:.10f}"
+                    )
+
+            # Update trail peak if price is making new highs
+            if pos.trail_active and price > pos.trail_peak:
+                pos.trail_peak = price
+
+            # 3. Rug protection still applies
+            if gain <= Settings.RUG_PROTECTION_PCT:
+                log.warning(
+                    f"⚠️ RUG_PROTECTION triggered for {pos.symbol}: "
+                    f"{gain * 100:.1f}% loss — trailing phase"
+                )
+                return f"RUG_PROTECTION (-{abs(gain) * 100:.1f}% from entry)"
+
+            # 4. Extended time stop
+            age = time.time() - pos.entry_time
+            if age >= Settings.MAX_POSITION_TIME_SECONDS:
+                return f"TIME_STOP_EXTENDED ({age / 60:.1f} min)"
 
         return None
 
     async def _exit_trade(self, pos: LivePaperPosition, exit_price: float, reason: str):
-        """Close trade with cost model applied."""
-        # Calculate cost model
-        cost_info = self._calculate_costs(pos, exit_price)
+        """Close trade (full or partial) with cost model applied."""
+        is_partial = reason.startswith("PARTIAL_TP") or reason.startswith("PARTIAL_STOP_LOSS")
 
-        result = await self.db.close_paper_trade(
-            pos.trade_id, exit_price, reason, cost_info=cost_info
-        )
-        del self.positions[pos.mint]
+        if is_partial and reason.startswith("PARTIAL_TP"):
+            sell_pct = Settings.PARTIAL_TP_SELL_PCT
+        elif is_partial and reason.startswith("PARTIAL_STOP_LOSS"):
+            sell_pct = Settings.PARTIAL_STOP_SELL_PCT
+        else:
+            sell_pct = 1.0
 
-        # Check for large loss cooldown
-        if result and result.get("net_pnl_pct", 0) <= Settings.LARGE_LOSS_THRESHOLD_PCT:
-            self._loss_cooldown_until = time.time() + Settings.LOSS_COOLDOWN_MINUTES * 60
-            self._loss_cooldown_active = True
-            log.warning(
-                f"LOSS_COOLDOWN: Trade {pos.trade_id} lost "
-                f"{result['net_pnl_pct']:.2%}. "
-                f"Cooling down for {Settings.LOSS_COOLDOWN_MINUTES:.0f} minutes."
+        sell_usd = pos.usd_size * sell_pct
+        remaining_usd = pos.usd_size - sell_usd
+
+        # Calculate cost model on the portion being sold
+        cost_info = self._calculate_costs(pos, exit_price, usd_size_override=sell_usd)
+
+        if is_partial and remaining_usd > 0:
+            # ── Partial exit: credit PnL, update position, keep tracking ──
+            raw_pnl_pct = (exit_price - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0.0
+            fee_pct = cost_info.get("fee_pct", 0.0)
+            slippage_pct = cost_info.get("slippage_pct", 0.0)
+            priority_fee_usd = cost_info.get("priority_fee_usd", 0.0)
+            net_pnl_pct = raw_pnl_pct - fee_pct - slippage_pct
+            net_usd_pnl = sell_usd * net_pnl_pct - priority_fee_usd
+
+            # Credit balance
+            balance_before = self.db.balance
+            self.db._balance += net_usd_pnl
+
+            # Record partial exit in portfolio_state
+            desc = (
+                f"Partial exit ({sell_pct:.0%}): {reason} | "
+                f"{raw_pnl_pct:+.2%} raw, {net_pnl_pct:+.2%} net "
+                f"(${net_usd_pnl:+.2f}) "
+                f"[fee={fee_pct:.2%}, slip={slippage_pct:.2%}]"
             )
-            await self.db.insert_system_event(
-                event_type="LOSS_COOLDOWN_START", severity="WARNING",
-                description=(
-                    f"Trade {pos.trade_id} lost {result['net_pnl_pct']:.2%}. "
-                    f"Cooldown for {Settings.LOSS_COOLDOWN_MINUTES:.0f}min."
-                ),
-                metadata={
-                    "trade_id": pos.trade_id,
-                    "net_pnl_pct": result["net_pnl_pct"],
-                },
+            await self.db.insert_portfolio_event(
+                event_type=reason.split(" ")[0],
+                trade_id=pos.trade_id,
+                balance_before=balance_before,
+                balance_after=self.db.balance,
+                usd_change=net_usd_pnl,
+                description=desc,
+            )
+            log.info(
+                f"📘 Partial exit {pos.trade_id} ({pos.symbol}): {reason} | {desc}"
             )
 
-        # Check daily loss circuit breaker
-        await self._check_circuit_breaker()
+            # Update position state
+            if not pos.original_usd_size:
+                pos.original_usd_size = pos.usd_size
+            pos.usd_size = remaining_usd
 
-    def _calculate_costs(self, pos: LivePaperPosition, exit_price: float) -> dict:
+            if reason.startswith("PARTIAL_TP"):
+                pos.partial_tp_taken = True
+                pos.trail_peak = exit_price
+            elif reason.startswith("PARTIAL_STOP_LOSS"):
+                pos.partial_stop_taken = True
+
+            # Do NOT remove from self.positions or demote from Tier 1
+        else:
+            # ── Full exit ──
+            result = await self.db.close_paper_trade(
+                pos.trade_id, exit_price, reason, cost_info=cost_info
+            )
+            del self.positions[pos.mint]
+
+            # Add trade cooldown
+            self._trade_cooldown_tokens[pos.mint] = (
+                time.time() + Settings.TRADE_COOLDOWN_MINUTES * 60
+            )
+
+            # Check for large loss cooldown
+            if result and result.get("net_pnl_pct", 0) <= Settings.LARGE_LOSS_THRESHOLD_PCT:
+                self._loss_cooldown_until = time.time() + Settings.LOSS_COOLDOWN_MINUTES * 60
+                self._loss_cooldown_active = True
+                log.warning(
+                    f"LOSS_COOLDOWN: Trade {pos.trade_id} lost "
+                    f"{result['net_pnl_pct']:.2%}. "
+                    f"Cooling down for {Settings.LOSS_COOLDOWN_MINUTES:.0f} minutes."
+                )
+                await self.db.insert_system_event(
+                    event_type="LOSS_COOLDOWN_START", severity="WARNING",
+                    description=(
+                        f"Trade {pos.trade_id} lost {result['net_pnl_pct']:.2%}. "
+                        f"Cooldown for {Settings.LOSS_COOLDOWN_MINUTES:.0f}min."
+                    ),
+                    metadata={
+                        "trade_id": pos.trade_id,
+                        "net_pnl_pct": result["net_pnl_pct"],
+                    },
+                )
+
+            # Check daily loss circuit breaker
+            await self._check_circuit_breaker()
+
+    def _calculate_costs(self, pos: LivePaperPosition, exit_price: float,
+                         usd_size_override: float = None) -> dict:
         """Apply fee + slippage cost model to paper trade."""
         entry_price = pos.entry_price
-        usd_size = pos.usd_size
+        usd_size = usd_size_override if usd_size_override is not None else pos.usd_size
         liquidity = pos.entry_liquidity
 
         # Fee: per side (entry + exit)
@@ -535,11 +662,17 @@ class PaperTradingEngine:
             size_ratio = 0.01
         slippage_pct = size_ratio * Settings.SLIPPAGE_FACTOR
         slippage_pct = min(slippage_pct, Settings.MAX_SLIPPAGE_PCT)
+        # Apply base slippage floor (realistic minimum DEX swap cost)
+        slippage_pct = max(slippage_pct, Settings.BASE_SLIPPAGE_PCT)
+
+        # Priority fee: round trip (entry + exit)
+        priority_fee_usd = Settings.PRIORITY_FEE_USD * 2
 
         return {
             "fee_pct": fee_pct,
             "slippage_pct": slippage_pct,
             "was_size_capped": pos.was_size_capped,
+            "priority_fee_usd": priority_fee_usd,
         }
 
     # ══════════════════════════════════════════════════════════
@@ -635,6 +768,14 @@ class PaperTradingEngine:
                         description=f"Data resumed for {buf.symbol}, allowing trades",
                     )
 
+            # Check trade cooldown (v4.1)
+            if buf.mint in self._trade_cooldown_tokens:
+                if now < self._trade_cooldown_tokens[buf.mint]:
+                    log.debug(f"  ⏳ {buf.symbol}: trade cooldown active")
+                    continue
+                else:
+                    del self._trade_cooldown_tokens[buf.mint]
+
             await self._evaluate_entry(buf)
 
     async def _evaluate_entry(self, buf: TokenBuffer):
@@ -720,6 +861,43 @@ class PaperTradingEngine:
                 buy_ratio=buy_ratio,
             )
             return
+
+        # ── 5b. Momentum confirmation filter (v4.1) ─────────
+        if Settings.MOMENTUM_CHECK_ENABLED:
+            prices_arr = buf.prices
+            # SMA check
+            sma_n = Settings.MOMENTUM_SMA_LOOKBACK
+            if len(prices_arr) >= sma_n:
+                sma = float(np.mean(prices_arr[-sma_n:]))
+                if price <= sma:
+                    reason = f"MOMENTUM_SMA_FAIL (price={price:.10f}, sma{sma_n}={sma:.10f})"
+                    log.debug(f"  ❌ {buf.symbol}: {reason}")
+                    await self.db.insert_filter_rejection(
+                        mint=buf.mint, symbol=buf.symbol, rejection_reason=reason,
+                        price_usd=price, liquidity_usd=liquidity, volume_5m=volume,
+                        buys_5m=buys, sells_5m=sells, market_cap=mcap,
+                        buy_ratio=buy_ratio,
+                    )
+                    return
+            else:
+                log.debug(f"  ℹ️ {buf.symbol}: Momentum SMA data insufficient ({len(prices_arr)}/{sma_n}) — skipping gate")
+
+            # Price delta check
+            delta_n = Settings.MOMENTUM_DELTA_LOOKBACK
+            if len(prices_arr) > delta_n:
+                price_delta = price - float(prices_arr[-delta_n])
+                if price_delta <= 0:
+                    reason = f"MOMENTUM_DELTA_FAIL (delta={price_delta:.10f}, lookback={delta_n})"
+                    log.debug(f"  ❌ {buf.symbol}: {reason}")
+                    await self.db.insert_filter_rejection(
+                        mint=buf.mint, symbol=buf.symbol, rejection_reason=reason,
+                        price_usd=price, liquidity_usd=liquidity, volume_5m=volume,
+                        buys_5m=buys, sells_5m=sells, market_cap=mcap,
+                        buy_ratio=buy_ratio,
+                    )
+                    return
+            else:
+                log.debug(f"  ℹ️ {buf.symbol}: Momentum delta data insufficient ({len(prices_arr)}/{delta_n}) — skipping gate")
 
         # ── 6. Calculate Hurst/CVD/Gini and apply entry gates ──
         H = hurst_exponent(buf.prices)
@@ -830,6 +1008,7 @@ class PaperTradingEngine:
             peak_high=entry_price, peak_low=entry_price,
             usd_size=usd_size, entry_liquidity=liquidity,
             was_size_capped=was_capped, last_tick_time=time.time(),
+            original_usd_size=usd_size,
         )
 
         # Promote to Tier 1 so the open position gets fast 2s polling
@@ -980,6 +1159,23 @@ class PaperTradingEngine:
                 f" Best trade:      {stats['best_pnl']:>+9.2%}\n"
                 f" Worst trade:     {stats['worst_pnl']:>+9.2%}"
             )
+            # ── Enhanced metrics (v4.1) ──────────────────────
+            ext = await self.db.get_extended_stats()
+            if ext:
+                log.info(
+                    f" Payoff ratio:    {ext['payoff_ratio']:>9.2f}\n"
+                    f" Profit factor:   {ext['profit_factor']:>9.2f}\n"
+                    f" Expectancy:      {ext['expectancy']:>+9.4f}\n"
+                    f" Avg hold time:   {ext['avg_hold_minutes']:>8.1f}m"
+                )
+            # ── Filter rejection breakdown ───────────────────
+            rej = await self.db.get_filter_rejection_counts(
+                since=self._last_report_time - self._report_interval
+            )
+            if rej:
+                parts = [f"{k}={v}" for k, v in rej.items() if v > 0]
+                if parts:
+                    log.info(f" Rejections:  {', '.join(parts)}")
         log.info(
             f"{'─' * 60}\n"
             f"  🎯 Dynamic TP:\n"

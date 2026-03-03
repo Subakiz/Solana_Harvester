@@ -33,7 +33,7 @@ class Settings:
     DB_PATH: str = _env("DB_PATH", "data/quant_harvest.db")
     DEXSCREENER_BASE: str = _env("DEXSCREENER_BASE_URL", "https://api.dexscreener.com")
     POLL_INTERVAL: float = _env("POLL_INTERVAL_SECONDS", 4.0, float)
-    ROLLING_WINDOW: int = _env("ROLLING_WINDOW_SIZE", 50, int)
+    ROLLING_WINDOW: int = _env("ROLLING_WINDOW_SIZE", 80, int)
 
     # ── Quant signal gates (used as entry filters when data is available) ──
     HURST_THRESHOLD: float = _env("HURST_THRESHOLD", 0.70, float)
@@ -41,7 +41,7 @@ class Settings:
     MIN_CVD_SLOPE: float = _env("MIN_CVD_SLOPE", 10.0, float)
     MAX_CVD_SLOPE: float = _env("MAX_CVD_SLOPE", 2000.0, float)
     CVD_LOOKBACK: int = _env("CVD_LOOKBACK_PERIODS", 10, int)
-    MIN_SNAPSHOTS_HURST: int = _env("MIN_SNAPSHOTS_HURST", 20, int)
+    MIN_SNAPSHOTS_HURST: int = _env("MIN_SNAPSHOTS_HURST", 15, int)
 
     # ── Entry Filters ─────────────────────────────────────────
     MIN_VOLUME_5M: float = _env("MIN_VOLUME_5M_USD", 500.0, float)
@@ -55,9 +55,19 @@ class Settings:
     # ── Exit Rules ────────────────────────────────────────────
     TIME_STOP_MINUTES: float = _env("TIME_STOP_MINUTES", 30.0, float)
     TIME_STOP_SECONDS: float = TIME_STOP_MINUTES * 60.0
-    RUG_PROTECTION_PCT: float = _env("RUG_PROTECTION_PCT", -0.50, float)
-    # TRAILING_STOP: REMOVED
-    # HARD_STOP: REMOVED (replaced by rug_protection)
+    RUG_PROTECTION_PCT: float = _env("RUG_PROTECTION_PCT", -0.15, float)
+
+    # ── Scaled Exit System (v4.1) ────────────────────────────
+    PARTIAL_TP_SELL_PCT: float = _env("PARTIAL_TP_SELL_PCT", 0.50, float)
+    TRAILING_STOP_PCT: float = _env("TRAILING_STOP_PCT", 0.25, float)
+    TRAILING_ACTIVATION_PCT: float = _env("TRAILING_ACTIVATION_PCT", 0.05, float)
+    MAX_GAIN_PCT: float = _env("MAX_GAIN_PCT", 2.00, float)
+    MAX_POSITION_TIME_MINUTES: float = _env("MAX_POSITION_TIME_MINUTES", 180.0, float)
+    MAX_POSITION_TIME_SECONDS: float = MAX_POSITION_TIME_MINUTES * 60.0
+
+    # ── Partial Stop Loss (v4.1) ─────────────────────────────
+    PARTIAL_STOP_LOSS_PCT: float = _env("PARTIAL_STOP_LOSS_PCT", -0.08, float)
+    PARTIAL_STOP_SELL_PCT: float = _env("PARTIAL_STOP_SELL_PCT", 0.50, float)
 
     # ── Position Sizing ───────────────────────────────────────
     POSITION_PCT: float = _env("POSITION_PCT", 0.10, float)
@@ -74,9 +84,11 @@ class Settings:
     LOSS_COOLDOWN_MINUTES: float = _env("LOSS_COOLDOWN_MINUTES", 5.0, float)
 
     # ── Cost Model (paper trading accuracy) ───────────────────
-    FEE_PER_SIDE_PCT: float = _env("FEE_PER_SIDE_PCT", 0.003, float)
-    SLIPPAGE_FACTOR: float = _env("SLIPPAGE_FACTOR", 0.5, float)
-    MAX_SLIPPAGE_PCT: float = _env("MAX_SLIPPAGE_PCT", 0.25, float)
+    FEE_PER_SIDE_PCT: float = _env("FEE_PER_SIDE_PCT", 0.005, float)
+    SLIPPAGE_FACTOR: float = _env("SLIPPAGE_FACTOR", 5.0, float)
+    MAX_SLIPPAGE_PCT: float = _env("MAX_SLIPPAGE_PCT", 3.0, float)
+    BASE_SLIPPAGE_PCT: float = _env("BASE_SLIPPAGE_PCT", 0.01, float)
+    PRIORITY_FEE_USD: float = _env("PRIORITY_FEE_USD", 0.05, float)
 
     # ── Data Reliability ──────────────────────────────────────
     DATA_STALE_WARNING_SECONDS: float = _env("DATA_STALE_WARNING_SECONDS", 60.0, float)
@@ -118,6 +130,18 @@ class Settings:
     DEAD_TOKEN_MIN_LIQUIDITY: float = _env("DEAD_TOKEN_MIN_LIQUIDITY_USD", 3000.0, float)
     STALE_TOKEN_MAX_AGE_HOURS: float = _env("STALE_TOKEN_MAX_AGE_HOURS", 2.0, float)
 
+    # ── Trade Cooldown (v4.1) ────────────────────────────────
+    TRADE_COOLDOWN_MINUTES: float = _env("TRADE_COOLDOWN_MINUTES", 5.0, float)
+
+    # ── Momentum Confirmation Filter (v4.1) ──────────────────
+    MOMENTUM_SMA_LOOKBACK: int = _env("MOMENTUM_SMA_LOOKBACK", 10, int)
+    MOMENTUM_DELTA_LOOKBACK: int = _env("MOMENTUM_DELTA_LOOKBACK", 5, int)
+    MOMENTUM_CHECK_ENABLED: bool = _env("MOMENTUM_CHECK_ENABLED", True, lambda v: v.lower() in ("1", "true", "yes"))
+
+    # ── Enhanced Discovery (v4.1) ────────────────────────────
+    DISCOVERY_ENABLE_LATEST_PAIRS: bool = _env("DISCOVERY_ENABLE_LATEST_PAIRS", True, lambda v: v.lower() in ("1", "true", "yes"))
+    DISCOVERY_ENABLE_PROFILES: bool = _env("DISCOVERY_ENABLE_PROFILES", True, lambda v: v.lower() in ("1", "true", "yes"))
+
     # ── Logging ───────────────────────────────────────────────
     LOG_LEVEL: str = _env("LOG_LEVEL", "DEBUG")
     LOG_FILE: str = _env("LOG_FILE", "logs/harvester.log")
@@ -143,4 +167,9 @@ class Settings:
             "Hurst gate": f"≥{cls.HURST_THRESHOLD}",
             "Gini gate": f"≤{cls.MAX_GINI}",
             "CVD slope": f"{cls.MIN_CVD_SLOPE}–{cls.MAX_CVD_SLOPE}",
+            "Partial TP": f"{cls.PARTIAL_TP_SELL_PCT:.0%}",
+            "Trail stop": f"{cls.TRAILING_STOP_PCT:.0%}",
+            "Max gain": f"{cls.MAX_GAIN_PCT:.0%}",
+            "Cooldown": f"{cls.TRADE_COOLDOWN_MINUTES:.0f}min",
+            "Momentum": "ON" if cls.MOMENTUM_CHECK_ENABLED else "OFF",
         }

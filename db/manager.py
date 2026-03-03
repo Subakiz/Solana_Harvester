@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS market_ticks (
 );
 CREATE INDEX IF NOT EXISTS idx_ticks_mint ON market_ticks(mint);
 CREATE INDEX IF NOT EXISTS idx_ticks_ts ON market_ticks(timestamp);
+CREATE INDEX IF NOT EXISTS idx_ticks_mint_id ON market_ticks(mint, id);
 
 CREATE TABLE IF NOT EXISTS paper_trades (
     trade_id TEXT PRIMARY KEY,

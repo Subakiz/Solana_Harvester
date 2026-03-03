@@ -716,6 +716,7 @@ class DataHarvester:
                     rejected_reasons["no_pair_address"] = rejected_reasons.get("no_pair_address", 0) + 1
                 else:
                     rejected_reasons["parse_failed"] = rejected_reasons.get("parse_failed", 0) + 1
+                    log.debug(f"Discovery parse failed for pair: {pair}")
                 continue
             mint, symbol, name, pa, dex = ident
 

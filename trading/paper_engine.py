@@ -173,6 +173,28 @@ class PaperTradingEngine:
             log.info(f"♻️ Recovered {len(self.positions)} open paper trades")
         await self._maybe_reoptimize_tp(force=True)
 
+        # ── Wait for initial harvester poll ──────────────────
+        # On cold start the poller has no tokens yet. Trigger discovery
+        # immediately so _scan_entries() doesn't log "Scanning 0 tokens"
+        # for the first polling cycle.
+        if not self.harvester.poller.tokens:
+            log.info("⏳ Waiting for initial harvester poll...")
+            wait_start = time.time()
+            timeout = 15.0
+            open_mints = set(self.positions.keys())
+            while not self.harvester.poller.tokens:
+                if time.time() - wait_start > timeout:
+                    log.warning("⚠️ Timeout waiting for initial harvester poll — continuing")
+                    break
+                await self.harvester.poll_tiered(open_mints)
+                if not self.harvester.poller.tokens:
+                    await asyncio.sleep(1.0)
+            if self.harvester.poller.tokens:
+                log.info(
+                    f"✅ Initial poll complete — "
+                    f"{len(self.harvester.poller.tokens)} tokens loaded"
+                )
+
     # ══════════════════════════════════════════════════════════
     # Dynamic TP Optimizer (PRESERVED from v2.0)
     # ══════════════════════════════════════════════════════════

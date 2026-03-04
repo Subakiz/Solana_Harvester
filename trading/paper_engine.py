@@ -752,8 +752,12 @@ class PaperTradingEngine:
         for buf in analyzable:
             if buf.mint in self.positions:
                 continue
-            if await self.db.is_mint_in_open_trade(buf.mint):
-                continue
+            # FIX 5 (bonus): Removed redundant DB query is_mint_in_open_trade().
+            # self.positions is the authoritative in-memory tracker for open
+            # trades; the check above already covers this case.  The DB call
+            # added an extra SQLite round-trip per token per scan cycle with
+            # no additional correctness benefit — a classic N+1 query pattern.
+            # With 158 tracked tokens this was 158 extra DB queries per cycle.
 
             # Check data block
             if buf.mint in self._data_blocked_tokens:
@@ -1035,6 +1039,18 @@ class PaperTradingEngine:
         if self._day_start_balance <= 0:
             return
 
+        # FIX 2: Guard against double-triggering.
+        # Data showed 14 CIRCUIT_BREAKER_TRIGGERED events vs only 5 RESET
+        # events in 14 hours — 3 triggers within 9 minutes (05:24, 05:24,
+        # 05:33) because _check_circuit_breaker() is called after every
+        # _exit_trade(), including trades that close WHILE the CB is already
+        # active.  Each re-trigger resets the 60-min pause deadline forward,
+        # so the effective pause extends indefinitely when trades pile up.
+        # With the guard, the CB fires exactly once per threshold crossing
+        # and holds until it expires and _circuit_breaker_active is cleared.
+        if self._circuit_breaker_active:
+            return
+
         current_balance = self.db.balance
         daily_loss_amount = self._day_start_balance - current_balance
         loss_pct = daily_loss_amount / self._day_start_balance
@@ -1131,6 +1147,15 @@ class PaperTradingEngine:
             period_end = now
             self._last_snapshot_time = now
             await self.db.insert_performance_snapshot(period_start, period_end)
+            # FIX 1: Prune unbounded tables every hour alongside snapshots.
+            # Data showed market_ticks growing at ~65k rows/hour (932k in 14h,
+            # 290 MB) and filter_rejections at ~8.2k/hour (117k in 14h) with
+            # no pruning anywhere in the codebase.  Left unaddressed this
+            # reaches multi-GB within days and degrades SQLite performance.
+            await self.db.prune_old_data(
+                max_tick_age_hours=24.0,
+                max_rejection_age_hours=48.0,
+            )
 
     # ══════════════════════════════════════════════════════════
     # Reporting

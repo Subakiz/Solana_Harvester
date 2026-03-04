@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS paper_trades (
 );
 CREATE INDEX IF NOT EXISTS idx_trades_status ON paper_trades(status);
 CREATE INDEX IF NOT EXISTS idx_trades_mint ON paper_trades(mint);
+CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON paper_trades(exit_time);
 
 CREATE TABLE IF NOT EXISTS quant_signals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,6 +113,7 @@ CREATE TABLE IF NOT EXISTS filter_rejections (
 );
 CREATE INDEX IF NOT EXISTS idx_rejections_reason ON filter_rejections(rejection_reason);
 CREATE INDEX IF NOT EXISTS idx_rejections_ts ON filter_rejections(timestamp);
+CREATE INDEX IF NOT EXISTS idx_rejections_mint_reason ON filter_rejections(mint, rejection_reason);
 
 CREATE TABLE IF NOT EXISTS trade_costs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -906,3 +908,67 @@ class DatabaseManager:
                 "worst_pnl": 0.0, "win_rate": 0.0,
                 "balance": self._balance,
             }
+
+    # ══════════════════════════════════════════════════════════
+    # Data Pruning (FIX 1)
+    # ══════════════════════════════════════════════════════════
+
+    async def prune_old_data(
+        self,
+        max_tick_age_hours: float = 24.0,
+        max_rejection_age_hours: float = 48.0,
+    ) -> dict:
+        """
+        FIX 1: Prune old rows from unbounded tables.
+
+        Data analysis showed market_ticks growing at ~65,000 rows/hour
+        (932k rows in 14h, 290 MB database).  filter_rejections growing
+        at ~8,200 rows/hour (117k rows, same 5 tokens rejected 28k times
+        for MCAP_OUT_OF_RANGE).  Without pruning the DB reaches multi-GB
+        in days and SQLite query latency degrades.
+
+        Keeps market_ticks for the last 24 hours (sufficient for any
+        active analysis window) and filter_rejections for 48 hours
+        (enough for trend analysis without accumulating millions of
+        identical rows from borderline tokens).
+
+        Returns dict with deleted row counts for logging.
+        """
+        now = time.time()
+        tick_cutoff = now - max_tick_age_hours * 3600.0
+        rejection_cutoff = now - max_rejection_age_hours * 3600.0
+        deleted = {"market_ticks": 0, "filter_rejections": 0}
+        try:
+            # Delete old ticks — idx_ticks_ts covers this WHERE clause
+            cursor = await self._db.execute(
+                "DELETE FROM market_ticks WHERE timestamp < ?",
+                (tick_cutoff,),
+            )
+            deleted["market_ticks"] = cursor.rowcount
+
+            # Delete old rejections — idx_rejections_ts covers this WHERE clause
+            cursor = await self._db.execute(
+                "DELETE FROM filter_rejections WHERE timestamp < ?",
+                (rejection_cutoff,),
+            )
+            deleted["filter_rejections"] = cursor.rowcount
+
+            await self._db.commit()
+
+            # Run VACUUM only when significant rows were pruned to reclaim disk space
+            if deleted["market_ticks"] + deleted["filter_rejections"] > 10_000:
+                await self._db.execute("PRAGMA incremental_vacuum(1000)")
+
+            log.info(
+                f"🗑️ DB pruning: removed {deleted['market_ticks']:,} ticks "
+                f"(>{max_tick_age_hours:.0f}h old), "
+                f"{deleted['filter_rejections']:,} rejections "
+                f"(>{max_rejection_age_hours:.0f}h old)"
+            )
+        except Exception as exc:
+            log.error(f"prune_old_data error: {exc}")
+            try:
+                await self._db.rollback()
+            except Exception:
+                pass
+        return deleted

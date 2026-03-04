@@ -223,6 +223,11 @@ class DatabaseManager:
             ("entry_buy_ratio", "REAL"),
             ("partial_tp_taken", "INTEGER DEFAULT 0"),
             ("trail_active", "INTEGER DEFAULT 0"),
+            # v5.0 additions
+            ("entry_atr", "REAL DEFAULT 0"),
+            ("per_trade_tp", "REAL DEFAULT 0"),
+            ("per_trade_sl", "REAL DEFAULT 0"),
+            ("pair_created_at", "REAL"),
         ]
         for col_name, col_type in new_cols:
             try:
@@ -239,6 +244,21 @@ class DatabaseManager:
             )
         except Exception:
             pass
+
+        # filter_rejections: v5.0 additions
+        rejection_new_cols = [
+            ("token_age_minutes", "REAL"),
+            ("volume_accel_ratio", "REAL"),
+            ("sol_price", "REAL"),
+            ("price_efficiency_ratio", "REAL"),
+        ]
+        for col_name, col_type in rejection_new_cols:
+            try:
+                await self._db.execute(
+                    f"ALTER TABLE filter_rejections ADD COLUMN {col_name} {col_type}"
+                )
+            except Exception:
+                pass  # Column already exists
 
         await self._db.commit()
 
@@ -300,7 +320,11 @@ class DatabaseManager:
                                entry_liquidity: float = 0.0,
                                entry_volume_5m: float = 0.0,
                                entry_market_cap: float = 0.0,
-                               entry_buy_ratio: float = 0.0) -> str:
+                               entry_buy_ratio: float = 0.0,
+                               entry_atr: float = 0.0,
+                               per_trade_tp: float = 0.0,
+                               per_trade_sl: float = 0.0,
+                               pair_created_at: Optional[float] = None) -> str:
         trade_id = f"PT-{uuid.uuid4().hex[:12].upper()}"
         now = time.time()
         try:
@@ -308,11 +332,13 @@ class DatabaseManager:
                 """INSERT INTO paper_trades
                    (trade_id, mint, symbol, status, entry_time, entry_price,
                     peak_high, peak_low, usd_size,
-                    entry_liquidity, entry_volume_5m, entry_market_cap, entry_buy_ratio)
-                   VALUES (?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    entry_liquidity, entry_volume_5m, entry_market_cap, entry_buy_ratio,
+                    entry_atr, per_trade_tp, per_trade_sl, pair_created_at)
+                   VALUES (?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (trade_id, mint, symbol, now, entry_price,
                  entry_price, entry_price, usd_size,
-                 entry_liquidity, entry_volume_5m, entry_market_cap, entry_buy_ratio),
+                 entry_liquidity, entry_volume_5m, entry_market_cap, entry_buy_ratio,
+                 entry_atr, per_trade_tp, per_trade_sl, pair_created_at),
             )
             # Record portfolio event
             await self._db.execute(
@@ -513,17 +539,23 @@ class DatabaseManager:
                                       buy_ratio: float = 0.0,
                                       hurst_value: float = 0.0,
                                       cvd_slope: float = 0.0,
-                                      gini_coeff: float = 0.0):
+                                      gini_coeff: float = 0.0,
+                                      token_age_minutes: Optional[float] = None,
+                                      volume_accel_ratio: Optional[float] = None,
+                                      sol_price: Optional[float] = None,
+                                      price_efficiency_ratio: Optional[float] = None):
         try:
             await self._db.execute(
                 """INSERT INTO filter_rejections
                    (timestamp, mint, symbol, rejection_reason,
                     price_usd, liquidity_usd, volume_5m, buys_5m, sells_5m,
-                    market_cap, buy_ratio, hurst_value, cvd_slope, gini_coeff)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    market_cap, buy_ratio, hurst_value, cvd_slope, gini_coeff,
+                    token_age_minutes, volume_accel_ratio, sol_price, price_efficiency_ratio)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (time.time(), mint, symbol, rejection_reason,
                  price_usd, liquidity_usd, volume_5m, buys_5m, sells_5m,
-                 market_cap, buy_ratio, hurst_value, cvd_slope, gini_coeff),
+                 market_cap, buy_ratio, hurst_value, cvd_slope, gini_coeff,
+                 token_age_minutes, volume_accel_ratio, sol_price, price_efficiency_ratio),
             )
             await self._db.commit()
         except Exception as exc:

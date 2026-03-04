@@ -57,6 +57,7 @@ class TokenBuffer:
     ticks: list[Tick] = field(default_factory=list)
     first_seen: float = field(default_factory=time.time)
     last_updated: float = field(default_factory=time.time)
+    pair_created_at: Optional[float] = None  # Unix timestamp (seconds) from DexScreener pairCreatedAt
 
     # ── Convenience numpy accessors ──────────────────────
     @property
@@ -117,6 +118,11 @@ class DataHarvester:
         self.rpc_limiter = AsyncRateLimiter(
             "SolanaRPC", Settings.RPC_RPM, period=60.0
         )
+
+        # ── SOL price tracking (v5.0) ─────────────────────────
+        self.sol_prices: list[tuple[float, float]] = []  # (timestamp, price)
+        self._sol_max_window: int = 900  # ~1 hour at 4s polling
+        self._sol_last_poll_time: float = 0.0
         
         # Cache Gini results to avoid hitting RPC repeatedly
         self._gini_cache: dict[str, tuple[float, float]] = {} # mint -> (gini, ts)
@@ -619,6 +625,9 @@ class DataHarvester:
                 dead_min_liquidity=Settings.DEAD_TOKEN_MIN_LIQUIDITY,
                 stale_max_age_hours=Settings.STALE_TOKEN_MAX_AGE_HOURS,
             )
+            # Poll SOL price once per discovery cycle (non-blocking)
+            if Settings.SOL_REGIME_ENABLED:
+                await self._poll_sol_price()
             log.debug(
                 f"Poll [DISCOVERY] │ {added} new tokens │ "
                 f"Budget: {self.poller._requests_in_window()}/"
@@ -827,6 +836,13 @@ class DataHarvester:
                 tick = self._parse_tick(pair)
                 if tick:
                     buf.append(tick, Settings.ROLLING_WINDOW)
+                # Extract pairCreatedAt (milliseconds → seconds)
+                pair_created_ms = pair.get("pairCreatedAt")
+                if pair_created_ms is not None:
+                    try:
+                        buf.pair_created_at = float(pair_created_ms) / 1000.0
+                    except (ValueError, TypeError):
+                        buf.pair_created_at = None
                 self.tokens[mint] = buf
                 self._discovery_total += 1
 
@@ -858,10 +874,18 @@ class DataHarvester:
             ident = self._parse_identity(pair)
             if ident:
                 _, symbol, name, pa, dex = ident
-                self.tokens[mint] = TokenBuffer(
+                buf = TokenBuffer(
                     mint=mint, symbol=symbol, name=name,
                     pair_address=pa, dex_id=dex,
                 )
+                # Extract pairCreatedAt on first creation
+                pair_created_ms = pair.get("pairCreatedAt")
+                if pair_created_ms is not None:
+                    try:
+                        buf.pair_created_at = float(pair_created_ms) / 1000.0
+                    except (ValueError, TypeError):
+                        buf.pair_created_at = None
+                self.tokens[mint] = buf
         if mint in self.tokens:
             buf = self.tokens[mint]
             # Update pair_address if a higher-liquidity pool emerged
@@ -869,6 +893,14 @@ class DataHarvester:
             if new_pa and new_pa != buf.pair_address:
                 buf.pair_address = new_pa
                 buf.dex_id = pair.get("dexId") or buf.dex_id
+            # Backfill pairCreatedAt if not yet set
+            if buf.pair_created_at is None:
+                pair_created_ms = pair.get("pairCreatedAt")
+                if pair_created_ms is not None:
+                    try:
+                        buf.pair_created_at = float(pair_created_ms) / 1000.0
+                    except (ValueError, TypeError):
+                        pass
             buf.append(tick, Settings.ROLLING_WINDOW)
 
     def _sync_tiered_to_legacy(self):
@@ -968,6 +1000,70 @@ class DataHarvester:
             g, ts = self._gini_cache[mint]
             if time.time() - ts < self._gini_cache_ttl: return g
         return None
+
+    # ══════════════════════════════════════════════════════════
+    # SOL Price Tracking (v5.0)
+    # ══════════════════════════════════════════════════════════
+
+    async def _poll_sol_price(self):
+        """Fetch the current SOL/USD price from DexScreener and append to rolling window."""
+        pair_address = Settings.SOL_PAIR_ADDRESS
+        if not pair_address:
+            return
+        try:
+            base = Settings.DEXSCREENER_BASE
+            url = f"{base}/latest/dex/pairs/solana/{pair_address}"
+            data = await self._fetch_json(url)
+            if not isinstance(data, dict):
+                return
+            pairs = data.get("pairs") or []
+            if not pairs:
+                return
+            price_str = pairs[0].get("priceUsd") or pairs[0].get("priceNative")
+            if not price_str:
+                return
+            price = float(price_str)
+            if price > 0:
+                now = time.time()
+                self.sol_prices.append((now, price))
+                # Keep rolling window
+                if len(self.sol_prices) > self._sol_max_window:
+                    self.sol_prices = self.sol_prices[-self._sol_max_window:]
+                self._sol_last_poll_time = now
+        except Exception as exc:
+            log.debug(f"SOL price poll failed (non-fatal): {exc}")
+
+    def get_sol_price(self) -> Optional[float]:
+        """Return the most recent SOL price, or None if unavailable."""
+        if not self.sol_prices:
+            return None
+        return self.sol_prices[-1][1]
+
+    def get_sol_sma(self, lookback: int) -> Optional[float]:
+        """Return the simple moving average of the last `lookback` SOL price observations."""
+        if len(self.sol_prices) < lookback:
+            return None
+        prices = [p for _, p in self.sol_prices[-lookback:]]
+        return float(sum(prices) / len(prices))
+
+    def get_sol_pct_change(self, window_seconds: float) -> Optional[float]:
+        """
+        Return the percentage change in SOL price over the last `window_seconds`.
+        Returns None if insufficient history.
+        """
+        if not self.sol_prices:
+            return None
+        now = time.time()
+        cutoff = now - window_seconds
+        # Find oldest price within the window
+        window_prices = [(ts, px) for ts, px in self.sol_prices if ts >= cutoff]
+        if len(window_prices) < 2:
+            return None
+        oldest_price = window_prices[0][1]
+        latest_price = window_prices[-1][1]
+        if oldest_price <= 0:
+            return None
+        return (latest_price - oldest_price) / oldest_price
 
 # ══════════════════════════════════════════════════════════════
 # Module-level utility

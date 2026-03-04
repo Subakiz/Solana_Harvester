@@ -194,10 +194,7 @@ class DatabaseManager:
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA synchronous=NORMAL")
 
-        for statement in _SCHEMA_SQL.strip().split(";"):
-            stmt = statement.strip()
-            if stmt:
-                await self._db.execute(stmt)
+        await self._db.executescript(_SCHEMA_SQL)
         await self._db.commit()
 
         # Migrate existing tables: add new columns if they don't exist

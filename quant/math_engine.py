@@ -4,10 +4,13 @@ Pure-function implementations of:
 1. Hurst Exponent via R/S (rescaled range) analysis
 2. Micro-CVD Cumulative Volume Delta proxy
 3. Gini Coefficient holder-concentration measure
+4. ATR (Average True Range) for per-trade TP/SL
+5. Price Efficiency Ratio for trend detection
+6. Volume Acceleration for momentum confirmation
 All functions are stateless and operate on numpy arrays.
 """
 import numpy as np
-from typing import Optional, Tuple
+from typing import Optional, Tuple, NamedTuple
 from utils.logger import get_logger
 
 log = get_logger("QuantMath")
@@ -238,3 +241,102 @@ def calculate_optimal_tp_from_dataframe(trades_df, min_tp: float = 0.05, max_tp:
             "ev_curve": [], "best_ev": 0.0, "sample_size": 0,
             "hit_rate": 0.0, "confidence": "ERROR", "reason": str(e)
         }
+
+# ═══════════════════════════════════════════════════════════════
+# 5. ATR — Average True Range (per-trade TP/SL)
+# ═══════════════════════════════════════════════════════════════
+
+def compute_atr(prices: np.ndarray, periods: int = 5) -> Optional[float]:
+    """
+    Compute a simplified ATR from a price series.
+    Uses abs(price[i] - price[i-1]) as the true range proxy.
+    Returns ATR as a fraction of the latest price (percentage-like).
+    Returns None if insufficient data (need at least periods+1 prices).
+    """
+    if prices is None or len(prices) < periods + 1:
+        return None
+    try:
+        px = np.asarray(prices, dtype=np.float64)
+        true_ranges = np.abs(np.diff(px))
+        atr_raw = float(np.mean(true_ranges[-periods:]))
+        latest_price = float(px[-1])
+        if latest_price <= 0:
+            return None
+        return atr_raw / latest_price
+    except Exception as exc:
+        log.error(f"ATR computation error: {exc}")
+        return None
+
+# ═══════════════════════════════════════════════════════════════
+# 6. PRICE EFFICIENCY RATIO — Trend vs. Range Detection
+# ═══════════════════════════════════════════════════════════════
+
+def price_efficiency_ratio(prices: np.ndarray, lookback: int = 30) -> Optional[float]:
+    """
+    Compute the Price Efficiency Ratio (PER).
+    PER = |prices[-1] - prices[-lookback]| / sum(|prices[i] - prices[i-1]|)
+    Values near 1.0 = straight-line trend; near 0.0 = range-bound chop.
+    Returns None if insufficient data.
+    """
+    if prices is None or len(prices) < lookback + 1:
+        return None
+    try:
+        px = np.asarray(prices, dtype=np.float64)
+        window = px[-lookback - 1:]
+        net_move = abs(float(window[-1]) - float(window[0]))
+        total_path = float(np.sum(np.abs(np.diff(window))))
+        if total_path <= 0:
+            return None
+        return float(np.clip(net_move / total_path, 0.0, 1.0))
+    except Exception as exc:
+        log.error(f"Price efficiency ratio error: {exc}")
+        return None
+
+# ═══════════════════════════════════════════════════════════════
+# 7. VOLUME ACCELERATION — Momentum Confirmation
+# ═══════════════════════════════════════════════════════════════
+
+class VolumeAccelResult(NamedTuple):
+    accel_ratio: Optional[float]
+    recent_buys_count: int
+
+def volume_acceleration(
+    buy_counts: np.ndarray,
+    sell_counts: np.ndarray,
+    lookback_short: int = 1,
+    lookback_long: int = 5,
+) -> VolumeAccelResult:
+    """
+    Compute volume (transaction) acceleration.
+    accel_ratio = short_window_rate / long_window_avg_rate
+    Returns VolumeAccelResult with accel_ratio and recent_buys_count.
+    """
+    if buy_counts is None or sell_counts is None:
+        return VolumeAccelResult(accel_ratio=None, recent_buys_count=0)
+
+    min_len = min(len(buy_counts), len(sell_counts))
+    if min_len < lookback_long:
+        return VolumeAccelResult(accel_ratio=None, recent_buys_count=0)
+
+    try:
+        buys = np.asarray(buy_counts, dtype=np.float64)[-min_len:]
+        sells = np.asarray(sell_counts, dtype=np.float64)[-min_len:]
+        total = buys + sells
+
+        short_rate = float(np.sum(total[-lookback_short:]))
+        long_avg = float(np.mean(total[-lookback_long:]))
+        recent_buys = int(np.sum(buys[-lookback_long:]))
+
+        if long_avg <= 0:
+            if short_rate > 0:
+                # Large finite value to indicate strong acceleration from zero baseline
+                accel = 100.0
+            else:
+                accel = None
+        else:
+            accel = short_rate / long_avg
+
+        return VolumeAccelResult(accel_ratio=accel, recent_buys_count=recent_buys)
+    except Exception as exc:
+        log.error(f"Volume acceleration error: {exc}")
+        return VolumeAccelResult(accel_ratio=None, recent_buys_count=0)

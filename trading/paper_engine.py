@@ -12,6 +12,7 @@ Changes from v3.0:
 - Enhanced performance reporting (payoff ratio, profit factor, etc.)
 """
 import asyncio
+import datetime
 import json
 import time
 import traceback
@@ -25,6 +26,7 @@ from db.manager import DatabaseManager
 from ingestion.harvester import DataHarvester, TokenBuffer
 from quant.math_engine import (
     hurst_exponent, micro_cvd, gini_coefficient, calculate_optimal_tp,
+    compute_atr, price_efficiency_ratio, volume_acceleration,
 )
 from utils.logger import get_logger
 
@@ -63,6 +65,13 @@ class LivePaperPosition:
     trail_active: bool = False
     trail_peak: float = 0.0
     partial_stop_taken: bool = False
+    # ── Per-trade dynamic exits (v5.0) ───────────────────
+    entry_atr: float = 0.0             # ATR at entry (price fraction)
+    per_trade_tp: float = 0.0          # Per-token TP computed at entry
+    per_trade_sl: float = 0.0          # Per-token SL (negative value)
+    breakeven_activated: bool = False  # Whether break-even stop is active
+    speed_bonus_applied: bool = False  # Whether TP speed bonus was applied
+    entry_timestamp: float = 0.0       # Entry time (for speed bonus calc)
 
 
 @dataclass
@@ -116,6 +125,9 @@ class PaperTradingEngine:
 
         # ── Trade cooldown: tokens blocked after trade exit (v4.1) ─
         self._trade_cooldown_tokens: dict[str, float] = {}  # mint -> resume_after_ts
+
+        # ── Portfolio heat pause (v5.0) ──────────────────────
+        self._portfolio_heat_until: float = 0.0
 
         # ── Hourly snapshots ─────────────────────────────────
         self._last_snapshot_time: float = time.time()
@@ -369,6 +381,29 @@ class PaperTradingEngine:
     async def _manage_positions(self):
         if not self.positions:
             return
+
+        # ── SOL crash check (v5.0) ───────────────────────────
+        sol_pct_change = self.harvester.get_sol_pct_change(Settings.SOL_CRASH_WINDOW_SECONDS)
+        if sol_pct_change is not None and sol_pct_change <= Settings.SOL_CRASH_PCT:
+            log.critical(
+                f"💥 SOL CRASH DETECTED: {sol_pct_change:+.2%} in "
+                f"{Settings.SOL_CRASH_WINDOW_SECONDS/60:.0f}min — force-closing ALL positions"
+            )
+            for mint, pos in list(self.positions.items()):
+                buf = self.harvester.get(mint)
+                exit_price = (buf.latest_price if buf and buf.latest_price > 0
+                              else pos.entry_price)
+                await self._exit_trade(pos, exit_price, "SOL_CRASH_EXIT")
+            # Activate circuit breaker
+            self._circuit_breaker_until = time.time() + Settings.CIRCUIT_BREAKER_MINUTES * 60
+            self._circuit_breaker_active = True
+            await self.db.insert_system_event(
+                event_type="SOL_CRASH_EXIT", severity="CRITICAL",
+                description=f"SOL dropped {sol_pct_change:+.2%} — all positions closed",
+                metadata={"sol_pct_change": sol_pct_change},
+            )
+            return
+
         for mint, pos in list(self.positions.items()):
             try:
                 buf = self.harvester.get(mint)
@@ -408,7 +443,7 @@ class PaperTradingEngine:
                     )
                     log.debug(
                         f"  📊 {pos.symbol}: ${current_price:.10f} │ "
-                        f"PnL={pnl:+.2%} │ TP@{self.optimizer.current_tp:.0%}"
+                        f"PnL={pnl:+.2%} │ TP@{pos.per_trade_tp if pos.per_trade_tp > 0 else self.optimizer.current_tp:.0%}"
                     )
             except Exception as e:
                 log.error(f"Error managing position {pos.symbol}: {e}")
@@ -462,34 +497,72 @@ class PaperTradingEngine:
 
     def _check_exits(self, pos: LivePaperPosition, price: float) -> Optional[str]:
         """
-        Evaluate exit conditions (v4.1 — Scaled Exit System).
+        Evaluate exit conditions (v5.0 — Per-Trade Dynamic Exits).
 
         Before partial TP:
-          1. DYNAMIC_TP → partial sell (or full sell if PARTIAL_TP_SELL_PCT=1.0)
-          2. PARTIAL_STOP_LOSS → partial sell at moderate drawdown
-          3. RUG_PROTECTION → full sell at severe loss
-          4. TIME_STOP at TIME_STOP_MINUTES
+          1. Speed bonus TP adjustment (first 60s)
+          2. Per-trade TP → partial sell
+          3. Break-even stop (after 4% gain, stop at entry+buffer)
+          4. Per-trade SL (liquidity-scaled, triggers full exit)
+          5. RUG_PROTECTION at -25% (catastrophic only)
+          6. TIME_STOP at TIME_STOP_MINUTES
         After partial TP (trailing phase):
           1. MAX_GAIN → force full exit (anti-greed)
-          2. TRAILING_STOP → trailing from peak high
+          2. TRAILING_STOP with time-decay tightening
           3. RUG_PROTECTION → still active
-          4. MAX_POSITION_TIME_MINUTES → extended time stop
+          4. HARD_TIME_STOP at 25min
         """
         ep = pos.entry_price
         if ep <= 0:
             return None
 
         gain = (price - ep) / ep
+        now = time.time()
+        pos_age = now - pos.entry_time
 
         if not pos.partial_tp_taken:
             # ── Phase 1: Pre-partial-TP ──────────────────────
 
-            # 1. Dynamic Take Profit (MFE-Optimized)
-            if gain >= self.optimizer.current_tp:
+            # Determine effective TP (per-trade or optimizer fallback)
+            effective_tp = pos.per_trade_tp if pos.per_trade_tp > 0 else self.optimizer.current_tp
+
+            # 1. Speed bonus check (first SPEED_BONUS_WINDOW_SECONDS)
+            if (not pos.speed_bonus_applied
+                    and pos_age <= Settings.SPEED_BONUS_WINDOW_SECONDS
+                    and gain >= Settings.SPEED_BONUS_THRESHOLD):
+                new_tp = min(
+                    effective_tp * Settings.SPEED_BONUS_MULTIPLIER,
+                    Settings.ATR_TP_MAX,
+                )
+                pos.per_trade_tp = new_tp
+                pos.speed_bonus_applied = True
+                effective_tp = new_tp
+                log.info(
+                    f"⚡ SPEED_BONUS for {pos.symbol}: TP raised to {new_tp:.1%} "
+                    f"(gain={gain:+.2%} in {pos_age:.0f}s)"
+                )
+
+            # 2. Dynamic Take Profit
+            if gain >= effective_tp:
                 reason_tag = "DYNAMIC_TP" if Settings.PARTIAL_TP_SELL_PCT >= 1.0 else "PARTIAL_TP"
                 return f"{reason_tag} (+{gain * 100:.1f}% gain)"
 
-            # 2. Rug Protection (checked before partial stop — more severe)
+            # 3. Break-even stop
+            if not pos.breakeven_activated and gain >= Settings.BREAKEVEN_ACTIVATION_PCT:
+                pos.breakeven_activated = True
+                log.info(
+                    f"🔒 BREAKEVEN activated for {pos.symbol}: "
+                    f"gain={gain:+.2%}, SL locked at +{Settings.BREAKEVEN_BUFFER_PCT:.1%}"
+                )
+            if pos.breakeven_activated and gain <= Settings.BREAKEVEN_BUFFER_PCT:
+                return f"BREAKEVEN_STOP (gain={gain:+.2%})"
+
+            # 4. Per-trade SL (liquidity-scaled, full exit)
+            effective_sl = pos.per_trade_sl if pos.per_trade_sl != 0 else Settings.PARTIAL_STOP_LOSS_PCT
+            if gain <= effective_sl:
+                return f"STOP_LOSS ({gain * 100:.1f}% loss)"
+
+            # 5. Rug Protection (catastrophic circuit breaker)
             if gain <= Settings.RUG_PROTECTION_PCT:
                 log.warning(
                     f"⚠️ RUG_PROTECTION triggered for {pos.symbol}: "
@@ -497,14 +570,9 @@ class PaperTradingEngine:
                 )
                 return f"RUG_PROTECTION (-{abs(gain) * 100:.1f}% from entry)"
 
-            # 3. Partial stop loss — moderate drawdown
-            if not pos.partial_stop_taken and gain <= Settings.PARTIAL_STOP_LOSS_PCT:
-                return f"PARTIAL_STOP_LOSS ({gain * 100:.1f}% loss)"
-
-            # 4. Time stop
-            age = time.time() - pos.entry_time
-            if age >= Settings.TIME_STOP_SECONDS:
-                return f"TIME_STOP ({age / 60:.1f} min)"
+            # 6. Time stop
+            if pos_age >= Settings.TIME_STOP_SECONDS:
+                return f"TIME_STOP ({pos_age / 60:.1f} min)"
         else:
             # ── Phase 2: Post-partial-TP (trailing stop phase) ──
 
@@ -512,13 +580,18 @@ class PaperTradingEngine:
             if gain >= Settings.MAX_GAIN_PCT:
                 return f"MAX_GAIN_CAP (+{gain * 100:.1f}% gain)"
 
-            # 2. Trailing stop
+            # 2. Trailing stop with time-decay tightening
+            trail_dist = Settings.TRAILING_STOP_PCT
+            if pos_age > Settings.TRAIL_TIGHTEN_2_MINUTES * 60:
+                trail_dist *= Settings.TRAIL_TIGHTEN_2_FACTOR
+            elif pos_age > Settings.TRAIL_TIGHTEN_1_MINUTES * 60:
+                trail_dist *= Settings.TRAIL_TIGHTEN_1_FACTOR
+
             if pos.trail_active:
                 trail_drop = (pos.trail_peak - price) / pos.trail_peak if pos.trail_peak > 0 else 0
-                if trail_drop >= Settings.TRAILING_STOP_PCT:
+                if trail_drop >= trail_dist:
                     return f"TRAILING_STOP (-{trail_drop * 100:.1f}% from peak ${pos.trail_peak:.10f})"
             else:
-                # Activate trailing stop once gain exceeds activation threshold
                 if gain >= Settings.TRAILING_ACTIVATION_PCT:
                     pos.trail_active = True
                     pos.trail_peak = price
@@ -539,10 +612,9 @@ class PaperTradingEngine:
                 )
                 return f"RUG_PROTECTION (-{abs(gain) * 100:.1f}% from entry)"
 
-            # 4. Extended time stop
-            age = time.time() - pos.entry_time
-            if age >= Settings.MAX_POSITION_TIME_SECONDS:
-                return f"TIME_STOP_EXTENDED ({age / 60:.1f} min)"
+            # 4. Hard time stop (25 min — replaces old 180 min extended stop)
+            if pos_age >= Settings.HARD_TIME_STOP_SECONDS:
+                return f"TIME_STOP_EXTENDED ({pos_age / 60:.1f} min)"
 
         return None
 
@@ -712,8 +784,28 @@ class PaperTradingEngine:
     # ══════════════════════════════════════════════════════════
 
     async def _scan_entries(self):
-        # Check circuit breaker
         now = time.time()
+
+        # ── UTC time blackout check (v5.0) ───────────────────
+        current_utc_hour = datetime.datetime.utcnow().hour
+        start_h = Settings.TRADING_BLACKOUT_START_UTC
+        end_h = Settings.TRADING_BLACKOUT_END_UTC
+        if start_h < end_h:
+            in_blackout = start_h <= current_utc_hour < end_h
+        else:
+            # Wraps midnight (e.g., 22:00 – 06:00)
+            in_blackout = current_utc_hour >= start_h or current_utc_hour < end_h
+        if in_blackout:
+            log.info(f"  🌙 UTC blackout ({start_h:02d}:00–{end_h:02d}:00) — skipping scan")
+            return
+
+        # ── Portfolio heat pause (v5.0) ──────────────────────
+        if now < self._portfolio_heat_until:
+            remaining = (self._portfolio_heat_until - now) / 60
+            log.info(f"  🔥 Portfolio heat pause — {remaining:.1f}min remaining")
+            return
+
+        # Check circuit breaker
         if now < self._circuit_breaker_until:
             remaining = (self._circuit_breaker_until - now) / 60
             log.info(f"  🔴 Circuit breaker active — {remaining:.1f}min remaining")
@@ -778,18 +870,24 @@ class PaperTradingEngine:
 
     async def _evaluate_entry(self, buf: TokenBuffer):
         """
-        Entry filter chain (fastest rejections first):
-        1. Activity check: buys + sells >= MIN_ACTIVITY_TXNS
-        2. Liquidity check: liquidity >= MIN_LIQUIDITY
-        3. Volume check: volume_5m >= MIN_VOLUME_5M
-        4. Market cap check: MIN_MARKET_CAP <= mcap <= MAX_MARKET_CAP
-        5. Buy ratio check: MIN_BUY_RATIO <= ratio <= MAX_BUY_RATIO
-        6. Quant signal gates (skipped if data unavailable):
-           6a. Hurst exponent >= HURST_THRESHOLD
-           6b. Gini coefficient <= MAX_GINI
-           6c. CVD slope within MIN_CVD_SLOPE..MAX_CVD_SLOPE
-        7. Position sizing check
-        8. ENTER TRADE
+        Entry filter chain (v5.0 — fastest rejections first):
+        1. Activity check (MIN_ACTIVITY_TXNS + MIN_BUY_TXNS_5M)
+        2. Liquidity check
+        3. Volume check
+        4. Market cap check
+        5. Buy ratio check
+        6. Token age check (NEW)
+        7. UTC time blackout (per-token secondary check)
+        8. SOL regime check (NEW)
+        9. Momentum SMA + delta
+        10. Volume acceleration (NEW)
+        11. Hurst gate (or PER for young tokens)
+        12. Gini gate — BOTH bounds (CRITICAL: MIN and MAX)
+        13. CVD slope gate
+        14. Portfolio heat check (NEW)
+        15. Position sizing
+        16. Compute per-trade TP/SL
+        17. ENTER TRADE
         """
         latest_tick = buf.ticks[-1] if buf.ticks else None
         if latest_tick is None:
@@ -806,6 +904,17 @@ class PaperTradingEngine:
         total_txns = buys + sells
         if total_txns < Settings.MIN_ACTIVITY_TXNS:
             reason = f"ACTIVITY_TOO_LOW (total_txns={total_txns}, min={Settings.MIN_ACTIVITY_TXNS})"
+            log.debug(f"  ❌ {buf.symbol}: {reason}")
+            await self.db.insert_filter_rejection(
+                mint=buf.mint, symbol=buf.symbol, rejection_reason=reason,
+                price_usd=price, liquidity_usd=liquidity, volume_5m=volume,
+                buys_5m=buys, sells_5m=sells, market_cap=mcap,
+            )
+            return
+
+        # Also check MIN_BUY_TXNS_5M
+        if buys < Settings.MIN_BUY_TXNS_5M:
+            reason = f"BUY_TXNS_5M_TOO_LOW (buys={buys}, min={Settings.MIN_BUY_TXNS_5M})"
             log.debug(f"  ❌ {buf.symbol}: {reason}")
             await self.db.insert_filter_rejection(
                 mint=buf.mint, symbol=buf.symbol, rejection_reason=reason,
@@ -848,7 +957,7 @@ class PaperTradingEngine:
             return
 
         # ── 5. Buy/sell ratio check ──────────────────────────
-        buy_ratio = buys / total_txns  # total_txns >= 3 guaranteed
+        buy_ratio = buys / total_txns
         if not (Settings.MIN_BUY_RATIO <= buy_ratio <= Settings.MAX_BUY_RATIO):
             reason = f"BUY_RATIO_OUT_OF_RANGE (ratio={buy_ratio:.2f}, range={Settings.MIN_BUY_RATIO:.2f}-{Settings.MAX_BUY_RATIO:.2f})"
             log.debug(f"  ❌ {buf.symbol}: {reason}")
@@ -860,10 +969,60 @@ class PaperTradingEngine:
             )
             return
 
-        # ── 5b. Momentum confirmation filter (v4.1) ─────────
+        # ── 6. Token age check (v5.0) ────────────────────────
+        token_age_minutes: Optional[float] = None
+        if buf.pair_created_at is not None:
+            token_age_seconds = time.time() - buf.pair_created_at
+            token_age_minutes = token_age_seconds / 60.0
+            min_age_s = Settings.TOKEN_MIN_AGE_MINUTES * 60
+            max_age_s = Settings.TOKEN_MAX_AGE_HOURS * 3600
+            if token_age_seconds < min_age_s:
+                reason = f"TOKEN_TOO_YOUNG (age={token_age_minutes:.1f}min, min={Settings.TOKEN_MIN_AGE_MINUTES:.0f}min)"
+                log.debug(f"  ❌ {buf.symbol}: {reason}")
+                await self.db.insert_filter_rejection(
+                    mint=buf.mint, symbol=buf.symbol, rejection_reason=reason,
+                    price_usd=price, liquidity_usd=liquidity, volume_5m=volume,
+                    buys_5m=buys, sells_5m=sells, market_cap=mcap,
+                    buy_ratio=buy_ratio, token_age_minutes=token_age_minutes,
+                )
+                return
+            if token_age_seconds > max_age_s:
+                reason = f"TOKEN_TOO_OLD (age={token_age_minutes:.1f}min, max={Settings.TOKEN_MAX_AGE_HOURS:.0f}h)"
+                log.debug(f"  ❌ {buf.symbol}: {reason}")
+                await self.db.insert_filter_rejection(
+                    mint=buf.mint, symbol=buf.symbol, rejection_reason=reason,
+                    price_usd=price, liquidity_usd=liquidity, volume_5m=volume,
+                    buys_5m=buys, sells_5m=sells, market_cap=mcap,
+                    buy_ratio=buy_ratio, token_age_minutes=token_age_minutes,
+                )
+                return
+        else:
+            log.debug(f"  ℹ️ {buf.symbol}: pair_created_at unavailable — skipping age gate")
+
+        # ── 7. SOL regime check (v5.0) ───────────────────────
+        sol_current_price: Optional[float] = None
+        if Settings.SOL_REGIME_ENABLED:
+            sol_sma = self.harvester.get_sol_sma(Settings.SOL_SMA_LOOKBACK)
+            sol_current_price = self.harvester.get_sol_price()
+            if sol_sma is not None and sol_current_price is not None:
+                if sol_current_price < sol_sma:
+                    reason = (f"SOL_DOWNTREND (sol={sol_current_price:.2f}, "
+                              f"sma{Settings.SOL_SMA_LOOKBACK}={sol_sma:.2f})")
+                    log.debug(f"  ❌ {buf.symbol}: {reason}")
+                    await self.db.insert_filter_rejection(
+                        mint=buf.mint, symbol=buf.symbol, rejection_reason=reason,
+                        price_usd=price, liquidity_usd=liquidity, volume_5m=volume,
+                        buys_5m=buys, sells_5m=sells, market_cap=mcap,
+                        buy_ratio=buy_ratio, token_age_minutes=token_age_minutes,
+                        sol_price=sol_current_price,
+                    )
+                    return
+            else:
+                log.debug(f"  ℹ️ {buf.symbol}: SOL data unavailable — skipping regime gate")
+
+        # ── 8. Momentum SMA + delta (v4.1) ───────────────────
         if Settings.MOMENTUM_CHECK_ENABLED:
             prices_arr = buf.prices
-            # SMA check
             sma_n = Settings.MOMENTUM_SMA_LOOKBACK
             if len(prices_arr) >= sma_n:
                 sma = float(np.mean(prices_arr[-sma_n:]))
@@ -880,7 +1039,6 @@ class PaperTradingEngine:
             else:
                 log.debug(f"  ℹ️ {buf.symbol}: Momentum SMA data insufficient ({len(prices_arr)}/{sma_n}) — skipping gate")
 
-            # Price delta check
             delta_n = Settings.MOMENTUM_DELTA_LOOKBACK
             if len(prices_arr) > delta_n:
                 price_delta = price - float(prices_arr[-delta_n])
@@ -897,7 +1055,25 @@ class PaperTradingEngine:
             else:
                 log.debug(f"  ℹ️ {buf.symbol}: Momentum delta data insufficient ({len(prices_arr)}/{delta_n}) — skipping gate")
 
-        # ── 6. Calculate Hurst/CVD/Gini and apply entry gates ──
+        # ── 9. Volume acceleration check (v5.0) ──────────────
+        vol_accel = volume_acceleration(buf.buys, buf.sells)
+        if vol_accel.accel_ratio is not None:
+            if vol_accel.accel_ratio < Settings.VOLUME_ACCEL_MULTIPLIER:
+                reason = (f"VOLUME_ACCEL_LOW (accel={vol_accel.accel_ratio:.2f}, "
+                          f"min={Settings.VOLUME_ACCEL_MULTIPLIER}x)")
+                log.debug(f"  ❌ {buf.symbol}: {reason}")
+                await self.db.insert_filter_rejection(
+                    mint=buf.mint, symbol=buf.symbol, rejection_reason=reason,
+                    price_usd=price, liquidity_usd=liquidity, volume_5m=volume,
+                    buys_5m=buys, sells_5m=sells, market_cap=mcap,
+                    buy_ratio=buy_ratio, token_age_minutes=token_age_minutes,
+                    volume_accel_ratio=vol_accel.accel_ratio,
+                )
+                return
+        else:
+            log.debug(f"  ℹ️ {buf.symbol}: Volume acceleration data insufficient — skipping gate")
+
+        # ── 10. Calculate Hurst/CVD/Gini and apply entry gates ──
         H = hurst_exponent(buf.prices)
         cvd_val, cvd_slope, is_bullish = micro_cvd(
             buf.buys, buf.sells, buf.volumes, buf.prices,
@@ -905,9 +1081,27 @@ class PaperTradingEngine:
         )
         gini = await self._get_gini(buf)
 
-        # ── 6a. Hurst gate ───────────────────────────────────
-        if H is None:
-            log.debug(f"  ℹ️ {buf.symbol}: Hurst data insufficient — skipping gate")
+        # ── 10a. Hurst gate ──────────────────────────────────
+        # For tokens with insufficient snapshot data, fall back to Price Efficiency Ratio
+        prices_arr = buf.prices
+        insufficient_hurst_data = buf.count < Settings.MIN_SNAPSHOTS_HURST
+        if H is None or insufficient_hurst_data:
+            per_val = price_efficiency_ratio(prices_arr)
+            if per_val is not None:
+                if per_val < 0.40:
+                    reason = f"PER_TOO_LOW (PER={per_val:.4f}, min=0.40)"
+                    log.debug(f"  ❌ {buf.symbol}: {reason}")
+                    await self.db.insert_filter_rejection(
+                        mint=buf.mint, symbol=buf.symbol, rejection_reason=reason,
+                        price_usd=price, liquidity_usd=liquidity, volume_5m=volume,
+                        buys_5m=buys, sells_5m=sells, market_cap=mcap,
+                        buy_ratio=buy_ratio, hurst_value=H or 0.0,
+                        cvd_slope=cvd_slope or 0.0, gini_coeff=gini or 0.0,
+                        price_efficiency_ratio=per_val,
+                    )
+                    return
+            else:
+                log.debug(f"  ℹ️ {buf.symbol}: PER data insufficient — skipping Hurst/PER gate")
         elif H < Settings.HURST_THRESHOLD:
             reason = f"HURST_TOO_LOW (H={H:.4f}, min={Settings.HURST_THRESHOLD})"
             log.debug(f"  ❌ {buf.symbol}: {reason}")
@@ -920,9 +1114,20 @@ class PaperTradingEngine:
             )
             return
 
-        # ── 6b. Gini gate ────────────────────────────────────
+        # ── 10b. Gini gate — BOTH bounds (CRITICAL v5.0 change) ──
         if gini is None:
             log.debug(f"  ℹ️ {buf.symbol}: Gini data unavailable — skipping gate")
+        elif gini < Settings.MIN_GINI:
+            reason = f"GINI_TOO_LOW (G={gini:.4f}, min={Settings.MIN_GINI})"
+            log.debug(f"  ❌ {buf.symbol}: {reason}")
+            await self.db.insert_filter_rejection(
+                mint=buf.mint, symbol=buf.symbol, rejection_reason=reason,
+                price_usd=price, liquidity_usd=liquidity, volume_5m=volume,
+                buys_5m=buys, sells_5m=sells, market_cap=mcap,
+                buy_ratio=buy_ratio, hurst_value=H or 0.0,
+                cvd_slope=cvd_slope or 0.0, gini_coeff=gini,
+            )
+            return
         elif gini > Settings.MAX_GINI:
             reason = f"GINI_TOO_HIGH (G={gini:.4f}, max={Settings.MAX_GINI})"
             log.debug(f"  ❌ {buf.symbol}: {reason}")
@@ -935,7 +1140,7 @@ class PaperTradingEngine:
             )
             return
 
-        # ── 6c. CVD slope gate ───────────────────────────────
+        # ── 10c. CVD slope gate ──────────────────────────────
         if cvd_slope is None:
             log.debug(f"  ℹ️ {buf.symbol}: CVD slope data unavailable — skipping gate")
         elif cvd_slope < Settings.MIN_CVD_SLOPE or cvd_slope > Settings.MAX_CVD_SLOPE:
@@ -950,14 +1155,40 @@ class PaperTradingEngine:
             )
             return
 
+        # ── 11. Portfolio heat check (v5.0) ──────────────────
+        if self.positions:
+            total_unrealized = 0.0
+            for p in self.positions.values():
+                p_buf = self.harvester.get(p.mint)
+                if p_buf and p_buf.latest_price > 0 and p.entry_price > 0:
+                    p_gain = (p_buf.latest_price - p.entry_price) / p.entry_price
+                    total_unrealized += (
+                        p_gain * p.usd_size / self.db.balance
+                        if self.db.balance > 0 else 0.0
+                    )
+            if total_unrealized <= Settings.PORTFOLIO_HEAT_LIMIT_PCT:
+                self._portfolio_heat_until = (
+                    time.time() + Settings.PORTFOLIO_HEAT_PAUSE_MINUTES * 60
+                )
+                reason = f"PORTFOLIO_HEAT_EXCEEDED (unrealized={total_unrealized:+.2%}, limit={Settings.PORTFOLIO_HEAT_LIMIT_PCT:.0%})"
+                log.warning(f"  🔥 {buf.symbol}: {reason} — pausing new entries")
+                await self.db.insert_filter_rejection(
+                    mint=buf.mint, symbol=buf.symbol, rejection_reason=reason,
+                    price_usd=price, liquidity_usd=liquidity, volume_5m=volume,
+                    buys_5m=buys, sells_5m=sells, market_cap=mcap,
+                    buy_ratio=buy_ratio,
+                )
+                return
+
         log.info(
             f"  📈 {buf.symbol}: All filters PASSED │ "
             f"Vol=${volume:,.0f} Liq=${liquidity:,.0f} MCap=${mcap:,.0f} "
             f"BuyR={buy_ratio:.2f} │ "
-            f"H={H or 0:.4f} CVD={cvd_slope or 0:.4f} G={gini or 0:.4f}"
+            f"H={H or 0:.4f} CVD={cvd_slope or 0:.4f} G={gini or 0:.4f} │ "
+            f"Accel={vol_accel.accel_ratio or 0:.2f}x"
         )
 
-        # ── 7. Position sizing ───────────────────────────────
+        # ── 12. Position sizing ──────────────────────────────
         usd_size, was_capped = self._calculate_position_size(liquidity)
         if usd_size <= 0:
             log.info(
@@ -977,14 +1208,33 @@ class PaperTradingEngine:
                 ),
             )
 
-        # ── 8. ENTER TRADE ───────────────────────────────────
+        # ── 13. Compute per-trade TP and SL ─────────────────
+        atr_val = compute_atr(buf.prices, Settings.ATR_LOOKBACK_PERIODS)
+        if atr_val is not None:
+            per_trade_tp = Settings.ATR_TP_MULTIPLIER * atr_val + Settings.ATR_TP_COST_BUFFER
+            per_trade_tp = max(Settings.ATR_TP_MIN, min(Settings.ATR_TP_MAX, per_trade_tp))
+            tp_source = "ATR"
+        else:
+            per_trade_tp = self.optimizer.current_tp
+            tp_source = "optimizer_fallback"
+
+        # Liquidity-scaled stop loss
+        if liquidity < Settings.SL_THIN_POOL_THRESHOLD:
+            per_trade_sl = Settings.SL_THIN_POOL_PCT
+        elif liquidity < Settings.SL_DEEP_POOL_THRESHOLD:
+            per_trade_sl = Settings.SL_MEDIUM_POOL_PCT
+        else:
+            per_trade_sl = Settings.SL_DEEP_POOL_PCT
+
+        # ── 14. ENTER TRADE ──────────────────────────────────
         entry_price = buf.latest_price
         log.info(
             f" {'━' * 50}\n"
             f"  🎯 PAPER BUY: {buf.symbol} @ ${entry_price:.10f} │ "
             f"Size=${usd_size:.2f} │ "
             f"H={H or 0:.4f} │ CVD_slope={cvd_slope or 0:.4f} │ "
-            f"G={gini or 0:.4f} │ TP={self.optimizer.current_tp:.0%}\n"
+            f"G={gini or 0:.4f} │ TP={per_trade_tp:.0%} ({tp_source}) │ "
+            f"SL={per_trade_sl:.0%}\n"
             f" {'━' * 50}"
         )
 
@@ -993,6 +1243,10 @@ class PaperTradingEngine:
             usd_size=usd_size, entry_liquidity=liquidity,
             entry_volume_5m=volume, entry_market_cap=mcap,
             entry_buy_ratio=buy_ratio,
+            entry_atr=atr_val or 0.0,
+            per_trade_tp=per_trade_tp,
+            per_trade_sl=per_trade_sl,
+            pair_created_at=buf.pair_created_at,
         )
         await self.db.insert_quant_signal(
             trade_id=trade_id,
@@ -1000,13 +1254,18 @@ class PaperTradingEngine:
             cvd_slope=cvd_slope or 0.0, gini_coeff=gini,
             snapshot_count=buf.count, buy_ratio=buy_ratio,
         )
+        now = time.time()
         self.positions[buf.mint] = LivePaperPosition(
             trade_id=trade_id, mint=buf.mint, symbol=buf.symbol,
-            entry_time=time.time(), entry_price=entry_price,
+            entry_time=now, entry_price=entry_price,
             peak_high=entry_price, peak_low=entry_price,
             usd_size=usd_size, entry_liquidity=liquidity,
-            was_size_capped=was_capped, last_tick_time=time.time(),
+            was_size_capped=was_capped, last_tick_time=now,
             original_usd_size=usd_size,
+            entry_atr=atr_val or 0.0,
+            per_trade_tp=per_trade_tp,
+            per_trade_sl=per_trade_sl,
+            entry_timestamp=now,
         )
 
         # Promote to Tier 1 so the open position gets fast 2s polling

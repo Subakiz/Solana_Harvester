@@ -37,7 +37,7 @@ class Settings:
 
     # ── Quant signal gates (used as entry filters when data is available) ──
     HURST_THRESHOLD: float = _env("HURST_THRESHOLD", 0.70, float)
-    MAX_GINI: float = _env("MAX_GINI_COEFFICIENT", 0.35, float)
+    MAX_GINI: float = _env("MAX_GINI_COEFFICIENT", 0.85, float)
     MIN_CVD_SLOPE: float = _env("MIN_CVD_SLOPE", 10.0, float)
     MAX_CVD_SLOPE: float = _env("MAX_CVD_SLOPE", 2000.0, float)
     CVD_LOOKBACK: int = _env("CVD_LOOKBACK_PERIODS", 10, int)
@@ -45,20 +45,20 @@ class Settings:
 
     # ── Entry Filters ─────────────────────────────────────────
     MIN_VOLUME_5M: float = _env("MIN_VOLUME_5M_USD", 500.0, float)
-    MIN_LIQUIDITY: float = _env("MIN_LIQUIDITY_USD", 50000.0, float)
+    MIN_LIQUIDITY: float = _env("MIN_LIQUIDITY_USD", 75000.0, float)
     MIN_MARKET_CAP: float = _env("MIN_MARKET_CAP", 50000.0, float)
     MAX_MARKET_CAP: float = _env("MAX_MARKET_CAP", 2000000.0, float)
-    MIN_BUY_RATIO: float = _env("MIN_BUY_RATIO", 0.40, float)
-    MAX_BUY_RATIO: float = _env("MAX_BUY_RATIO", 0.75, float)
-    MIN_ACTIVITY_TXNS: int = _env("MIN_ACTIVITY_TXNS", 3, int)
+    MIN_BUY_RATIO: float = _env("MIN_BUY_RATIO", 0.65, float)
+    MAX_BUY_RATIO: float = _env("MAX_BUY_RATIO", 0.95, float)
+    MIN_ACTIVITY_TXNS: int = _env("MIN_ACTIVITY_TXNS", 15, int)
 
     # ── Exit Rules ────────────────────────────────────────────
     TIME_STOP_MINUTES: float = _env("TIME_STOP_MINUTES", 30.0, float)
     TIME_STOP_SECONDS: float = TIME_STOP_MINUTES * 60.0
-    RUG_PROTECTION_PCT: float = _env("RUG_PROTECTION_PCT", -0.15, float)
+    RUG_PROTECTION_PCT: float = _env("RUG_PROTECTION_PCT", -0.25, float)
 
     # ── Scaled Exit System (v4.1) ────────────────────────────
-    PARTIAL_TP_SELL_PCT: float = _env("PARTIAL_TP_SELL_PCT", 0.50, float)
+    PARTIAL_TP_SELL_PCT: float = _env("PARTIAL_TP_SELL_PCT", 0.60, float)
     TRAILING_STOP_PCT: float = _env("TRAILING_STOP_PCT", 0.25, float)
     TRAILING_ACTIVATION_PCT: float = _env("TRAILING_ACTIVATION_PCT", 0.05, float)
     MAX_GAIN_PCT: float = _env("MAX_GAIN_PCT", 2.00, float)
@@ -76,7 +76,7 @@ class Settings:
     INITIAL_BALANCE: float = _env("INITIAL_BALANCE", 10000.0, float)
 
     # ── Risk Management ───────────────────────────────────────
-    MAX_OPEN_TRADES: int = _env("MAX_OPEN_PAPER_TRADES", 5, int)
+    MAX_OPEN_TRADES: int = _env("MAX_OPEN_PAPER_TRADES", 3, int)
     MAX_POSITIONS_PER_TOKEN: int = _env("MAX_POSITIONS_PER_TOKEN", 1, int)
     DAILY_LOSS_LIMIT_PCT: float = _env("DAILY_LOSS_LIMIT_PCT", 0.15, float)
     CIRCUIT_BREAKER_MINUTES: float = _env("CIRCUIT_BREAKER_MINUTES", 60.0, float)
@@ -152,6 +152,58 @@ class Settings:
     # ── Misc ──────────────────────────────────────────────────
     TOP_HOLDERS: int = _env("TOP_HOLDERS_COUNT", 50, int)
 
+    # ── Enhanced Entry Filters (v5.0) ─────────────────────────
+
+    # Entry selectivity
+    MIN_GINI: float = _env("MIN_GINI_COEFFICIENT", 0.40, float)
+    TOKEN_MIN_AGE_MINUTES: float = _env("TOKEN_MIN_AGE_MINUTES", 30.0, float)
+    TOKEN_MAX_AGE_HOURS: float = _env("TOKEN_MAX_AGE_HOURS", 6.0, float)
+    MIN_BUY_TXNS_5M: int = _env("MIN_BUY_TXNS_5M", 15, int)
+    VOLUME_ACCEL_MULTIPLIER: float = _env("VOLUME_ACCEL_MULTIPLIER", 3.0, float)
+    MAX_SINGLE_TXN_CONCENTRATION: float = _env("MAX_SINGLE_TXN_CONCENTRATION", 0.30, float)
+
+    # SOL regime filter
+    SOL_REGIME_ENABLED: bool = _env("SOL_REGIME_FILTER_ENABLED", True, lambda v: v.lower() in ("1", "true", "yes"))
+    SOL_PAIR_ADDRESS: str = _env("SOL_PAIR_ADDRESS", "")  # Set in .env: Raydium SOL/USDC pair address e.g. 58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWaS2GkQ8stGK
+    SOL_SMA_LOOKBACK: int = _env("SOL_SMA_LOOKBACK", 15, int)
+    SOL_CRASH_PCT: float = _env("SOL_CRASH_PCT", -0.02, float)
+    SOL_CRASH_WINDOW_SECONDS: float = _env("SOL_CRASH_WINDOW_SECONDS", 900.0, float)
+
+    # UTC time blackout filter
+    TRADING_BLACKOUT_START_UTC: int = _env("TRADING_BLACKOUT_START_UTC", 2, int)
+    TRADING_BLACKOUT_END_UTC: int = _env("TRADING_BLACKOUT_END_UTC", 6, int)
+
+    # Per-trade dynamic exits (v5.0)
+    ATR_TP_MULTIPLIER: float = _env("ATR_TP_MULTIPLIER", 1.5, float)
+    ATR_TP_COST_BUFFER: float = _env("ATR_TP_COST_BUFFER", 0.02, float)
+    ATR_TP_MIN: float = _env("ATR_TP_MIN", 0.04, float)
+    ATR_TP_MAX: float = _env("ATR_TP_MAX", 0.15, float)
+    ATR_LOOKBACK_PERIODS: int = _env("ATR_LOOKBACK_PERIODS", 5, int)
+    SPEED_BONUS_THRESHOLD: float = _env("SPEED_BONUS_THRESHOLD", 0.01, float)
+    SPEED_BONUS_MULTIPLIER: float = _env("SPEED_BONUS_MULTIPLIER", 1.3, float)
+    SPEED_BONUS_WINDOW_SECONDS: float = _env("SPEED_BONUS_WINDOW_SECONDS", 60.0, float)
+    BREAKEVEN_ACTIVATION_PCT: float = _env("BREAKEVEN_ACTIVATION_PCT", 0.04, float)
+    BREAKEVEN_BUFFER_PCT: float = _env("BREAKEVEN_BUFFER_PCT", 0.02, float)
+
+    # Liquidity-scaled stop loss
+    SL_THIN_POOL_PCT: float = _env("SL_THIN_POOL_PCT", -0.06, float)
+    SL_MEDIUM_POOL_PCT: float = _env("SL_MEDIUM_POOL_PCT", -0.08, float)
+    SL_DEEP_POOL_PCT: float = _env("SL_DEEP_POOL_PCT", -0.10, float)
+    SL_THIN_POOL_THRESHOLD: float = _env("SL_THIN_POOL_THRESHOLD", 100000.0, float)
+    SL_DEEP_POOL_THRESHOLD: float = _env("SL_DEEP_POOL_THRESHOLD", 500000.0, float)
+
+    # Trailing stop time decay
+    TRAIL_TIGHTEN_1_MINUTES: float = _env("TRAIL_TIGHTEN_1_MINUTES", 15.0, float)
+    TRAIL_TIGHTEN_1_FACTOR: float = _env("TRAIL_TIGHTEN_1_FACTOR", 0.7, float)
+    TRAIL_TIGHTEN_2_MINUTES: float = _env("TRAIL_TIGHTEN_2_MINUTES", 20.0, float)
+    TRAIL_TIGHTEN_2_FACTOR: float = _env("TRAIL_TIGHTEN_2_FACTOR", 0.5, float)
+    HARD_TIME_STOP_MINUTES: float = _env("HARD_TIME_STOP_MINUTES", 25.0, float)
+    HARD_TIME_STOP_SECONDS: float = HARD_TIME_STOP_MINUTES * 60.0
+
+    # Portfolio-level risk
+    PORTFOLIO_HEAT_LIMIT_PCT: float = _env("PORTFOLIO_HEAT_LIMIT_PCT", -0.05, float)
+    PORTFOLIO_HEAT_PAUSE_MINUTES: float = _env("PORTFOLIO_HEAT_PAUSE_MINUTES", 30.0, float)
+
     @classmethod
     def summary(cls) -> dict[str, str]:
         """Return a dict of key settings for display at startup."""
@@ -165,14 +217,20 @@ class Settings:
             "Buy ratio": f"{cls.MIN_BUY_RATIO:.0%}-{cls.MAX_BUY_RATIO:.0%}",
             "Rug protect": f"{cls.RUG_PROTECTION_PCT:.0%}",
             "Time stop": f"{cls.TIME_STOP_MINUTES:.0f}min",
+            "Hard time stop": f"{cls.HARD_TIME_STOP_MINUTES:.0f}min",
             "Position": f"{cls.POSITION_PCT:.0%} bal / {cls.MAX_LIQUIDITY_PCT:.0%} liq",
             "Max open": str(cls.MAX_OPEN_TRADES),
             "Hurst gate": f"≥{cls.HURST_THRESHOLD}",
-            "Gini gate": f"≤{cls.MAX_GINI}",
+            "Gini gate": f"{cls.MIN_GINI}–{cls.MAX_GINI}",
             "CVD slope": f"{cls.MIN_CVD_SLOPE}–{cls.MAX_CVD_SLOPE}",
             "Partial TP": f"{cls.PARTIAL_TP_SELL_PCT:.0%}",
             "Trail stop": f"{cls.TRAILING_STOP_PCT:.0%}",
             "Max gain": f"{cls.MAX_GAIN_PCT:.0%}",
             "Cooldown": f"{cls.TRADE_COOLDOWN_MINUTES:.0f}min",
             "Momentum": "ON" if cls.MOMENTUM_CHECK_ENABLED else "OFF",
+            "Token age": f"{cls.TOKEN_MIN_AGE_MINUTES:.0f}min–{cls.TOKEN_MAX_AGE_HOURS:.0f}h",
+            "Vol accel": f"≥{cls.VOLUME_ACCEL_MULTIPLIER}x",
+            "SOL regime": "ON" if cls.SOL_REGIME_ENABLED else "OFF",
+            "ATR TP range": f"{cls.ATR_TP_MIN:.0%}–{cls.ATR_TP_MAX:.0%}",
+            "SL (thin/med/deep)": f"{cls.SL_THIN_POOL_PCT:.0%}/{cls.SL_MEDIUM_POOL_PCT:.0%}/{cls.SL_DEEP_POOL_PCT:.0%}",
         }

@@ -121,6 +121,11 @@ class Settings:
     DISCOVERY_MIN_MCAP: float = _env("DISCOVERY_MIN_MCAP", 10000.0, float)
     DISCOVERY_MAX_MCAP: float = _env("DISCOVERY_MAX_MCAP", 10000000.0, float)
 
+    # Minimum liquidity to include a token in the analyzable set (tracking gate).
+    # Intentionally lower than MIN_LIQUIDITY so the paper engine's own entry
+    # filter decides what qualifies — tracking is free, exclusion is not.
+    TRACKING_MIN_LIQUIDITY: float = _env("TRACKING_MIN_LIQUIDITY_USD", 5000.0, float)
+
     # Tier 2 promotion thresholds (near entry filters)
     HOT_MIN_VOLUME: float = _env("HOT_MIN_VOLUME_5M_USD", 200.0, float)
     HOT_MIN_LIQUIDITY: float = _env("HOT_MIN_LIQUIDITY_USD", 15000.0, float)

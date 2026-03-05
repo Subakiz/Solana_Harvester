@@ -219,6 +219,7 @@ class TieredPoller:
         hot_demote_min_mcap: float = 20000.0,
         hot_demote_max_mcap: float = 3000000.0,
         hot_demote_zero_vol: int = 5,         # Zero-vol polls that trigger T2 demotion
+        hot_max_age_hours: float = 6.0,       # Age above which T2 tokens are demoted
         dead_zero_vol_polls: int = 20,
         dead_min_liquidity: float = 3000.0,
         dead_min_mcap: float = 5000.0,        # Mcap below this → token effectively rugged
@@ -245,6 +246,22 @@ class TieredPoller:
                     token.promotion_time = now
                 continue
 
+            # TIER 2 DEMOTION CRITERIA (evaluated before promotion so that an
+            # already-hot token that has grown stale is not silently re-promoted)
+            if token.tier == TokenTier.HOT_WATCHLIST:
+                token_age_hours = (now - token.added_time) / 3600.0
+                demote = (
+                    token.last_volume_5m < hot_demote_min_volume
+                    or token.last_liquidity < hot_demote_min_liquidity
+                    or token.last_mcap < hot_demote_min_mcap
+                    or token.last_mcap > hot_demote_max_mcap
+                    or token.consecutive_zero_vol >= hot_demote_zero_vol
+                    or token_age_hours > hot_max_age_hours
+                )
+                if demote:
+                    token.tier = TokenTier.WARM_SCANNER
+                    continue
+
             # TIER 2 PROMOTION CRITERIA
             promotes_to_hot = (
                 token.last_volume_5m >= hot_min_volume
@@ -265,19 +282,6 @@ class TieredPoller:
                         token.promotion_time = now
                     continue
 
-            # TIER 2 DEMOTION CRITERIA
-            if token.tier == TokenTier.HOT_WATCHLIST:
-                demote = (
-                    token.last_volume_5m < hot_demote_min_volume
-                    or token.last_liquidity < hot_demote_min_liquidity
-                    or token.last_mcap < hot_demote_min_mcap
-                    or token.last_mcap > hot_demote_max_mcap
-                    or token.consecutive_zero_vol >= hot_demote_zero_vol
-                )
-                if demote:
-                    token.tier = TokenTier.WARM_SCANNER
-                    continue
-
             # Tokens that were Tier 1 but position closed: ensure they leave Tier 1.
             # If they didn't qualify for Tier 2 above (or T2 is full), put in Tier 3.
             if old_tier == TokenTier.OPEN_POSITION and mint not in open_position_mints:
@@ -289,16 +293,23 @@ class TieredPoller:
         stale_age_seconds = stale_max_age_hours * 3600.0
         to_remove = [
             mint for mint, t in self.tokens.items()
-            if t.tier == TokenTier.WARM_SCANNER
-            and mint not in open_position_mints
+            if mint not in open_position_mints
+            and t.tier != TokenTier.OPEN_POSITION
             and (
-                t.consecutive_zero_vol >= dead_zero_vol_polls
-                or t.last_mcap < dead_min_mcap
-                or t.last_liquidity < dead_min_liquidity
-                or (
-                    now - t.added_time > stale_age_seconds
-                    and t.last_volume_5m < stale_min_volume
-                )
+                (t.tier == TokenTier.WARM_SCANNER and (
+                    t.consecutive_zero_vol >= dead_zero_vol_polls
+                    or t.last_mcap < dead_min_mcap
+                    or t.last_liquidity < dead_min_liquidity
+                    or (
+                        now - t.added_time > stale_age_seconds
+                        and t.last_volume_5m < stale_min_volume
+                    )
+                ))
+                or
+                # Also evict HOT_WATCHLIST tokens that are too old with no volume
+                (t.tier == TokenTier.HOT_WATCHLIST
+                 and now - t.added_time > stale_age_seconds
+                 and t.last_volume_5m < stale_min_volume)
             )
         ]
         for mint in to_remove:

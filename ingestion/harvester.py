@@ -807,7 +807,7 @@ class DataHarvester:
             if pair_created_ms is not None:
                 try:
                     pair_age_seconds = time.time() - (float(pair_created_ms) / 1000.0)
-                    if pair_age_seconds > Settings.TOKEN_MAX_AGE_HOURS * 3600:
+                    if pair_age_seconds > 0 and pair_age_seconds > Settings.TOKEN_MAX_AGE_HOURS * 3600:
                         rejected_reasons["too_old"] = rejected_reasons.get("too_old", 0) + 1
                         continue
                 except (ValueError, TypeError):

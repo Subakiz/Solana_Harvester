@@ -802,6 +802,17 @@ class DataHarvester:
                 rejected_reasons["high_mcap"] = rejected_reasons.get("high_mcap", 0) + 1
                 continue
 
+            # Reject tokens older than TOKEN_MAX_AGE_HOURS at discovery intake
+            pair_created_ms = pair.get("pairCreatedAt")
+            if pair_created_ms is not None:
+                try:
+                    pair_age_seconds = time.time() - (float(pair_created_ms) / 1000.0)
+                    if pair_age_seconds > Settings.TOKEN_MAX_AGE_HOURS * 3600:
+                        rejected_reasons["too_old"] = rejected_reasons.get("too_old", 0) + 1
+                        continue
+                except (ValueError, TypeError):
+                    pass  # If we can't parse the age, allow the token through
+
             # Check Tier 3 capacity
             t3_count = sum(
                 1 for t in self.poller.tokens.values()

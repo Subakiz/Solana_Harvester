@@ -59,6 +59,12 @@ class TokenBuffer:
     last_updated: float = field(default_factory=time.time)
     pair_created_at: Optional[float] = None  # Unix timestamp (seconds) from DexScreener pairCreatedAt
 
+    # ── Safety enrichment (v5.2) ──────────────────────────
+    mint_renounced: Optional[bool] = None      # True = renounced (safe), False = active (dangerous)
+    lp_locked: Optional[bool] = None           # True = locked (safe), False = unlocked (dangerous)
+    rugcheck_score: Optional[int] = None       # Integer risk score from RugCheck (higher = riskier)
+    is_pumpfun_migration: Optional[bool] = None  # True = token migrated from pump.fun to Raydium
+
     # ── Convenience numpy accessors ──────────────────────
     @property
     def prices(self) -> np.ndarray:
@@ -137,6 +143,9 @@ class DataHarvester:
 
         # Performance counters (reset each poll for logging)
         self._poll_stats: dict[str, int] = {}
+
+        # ── Safety enrichment cache (v5.2) ─────────────────────
+        self._safety_cache: dict[str, dict] = {}  # mint -> safety check results
 
         # ── Tiered polling scheduler (v3.1) ──────────────────
         self.poller = TieredPoller(
@@ -822,6 +831,26 @@ class DataHarvester:
                 rejected_reasons["scanner_full"] = rejected_reasons.get("scanner_full", 0) + 1
                 break
 
+            # ── Safety enrichment checks (v5.2) ──────────────
+            safety_data: dict = {}
+            if mint not in self._safety_cache:
+                if Settings.RUGCHECK_ENABLED:
+                    rc_data = await self._fetch_rugcheck(mint)
+                    safety_data.update(rc_data)
+                if Settings.PUMPFUN_CHECK_ENABLED:
+                    pf_data = await self._fetch_pumpfun_status(mint)
+                    safety_data.update(pf_data)
+                self._safety_cache[mint] = safety_data
+            else:
+                safety_data = self._safety_cache[mint]
+
+            # Hard reject: mint authority not renounced (rug vector)
+            if (Settings.RUGCHECK_REQUIRE_MINT_RENOUNCED
+                    and safety_data.get("mint_renounced") is not None
+                    and safety_data["mint_renounced"] is False):
+                rejected_reasons["mint_not_renounced"] = rejected_reasons.get("mint_not_renounced", 0) + 1
+                continue
+
             buys_5m = int((pair.get("txns") or {}).get("m5", {}).get("buys") or 0)
             sells_5m = int((pair.get("txns") or {}).get("m5", {}).get("sells") or 0)
 
@@ -856,6 +885,12 @@ class DataHarvester:
                         buf.pair_created_at = float(pair_created_ms) / 1000.0
                     except (ValueError, TypeError):
                         buf.pair_created_at = None
+                # Apply safety enrichment data (v5.2)
+                if safety_data:
+                    buf.mint_renounced = safety_data.get("mint_renounced")
+                    buf.lp_locked = safety_data.get("lp_locked")
+                    buf.rugcheck_score = safety_data.get("rugcheck_score")
+                    buf.is_pumpfun_migration = safety_data.get("is_pumpfun_migration")
                 self.tokens[mint] = buf
                 self._discovery_total += 1
 
@@ -1013,6 +1048,89 @@ class DataHarvester:
             g, ts = self._gini_cache[mint]
             if time.time() - ts < self._gini_cache_ttl: return g
         return None
+
+    # ══════════════════════════════════════════════════════════
+    # Safety Enrichment — RugCheck & pump.fun (v5.2)
+    # ══════════════════════════════════════════════════════════
+
+    async def _fetch_rugcheck(self, mint: str) -> dict:
+        """
+        Fetch token safety data from RugCheck API.
+        Returns dict with mint_renounced, lp_locked, rugcheck_score.
+        Fails open: returns all-None on any error.
+        """
+        fail_result = {"mint_renounced": None, "lp_locked": None, "rugcheck_score": None}
+        try:
+            session = await self._dex_session()
+            url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    log.warning(
+                        f"RugCheck HTTP {resp.status} for {mint[:8]}… — skipping safety check"
+                    )
+                    return fail_result
+                data = await resp.json(content_type=None)
+
+            risks = data.get("risks") or []
+            score = data.get("score")
+
+            # Mint authority: dangerous if any risk with "Mint" in name at "danger" level
+            mint_danger = any(
+                "mint" in (r.get("name") or "").lower()
+                and r.get("level") == "danger"
+                for r in risks
+            )
+            mint_renounced = not mint_danger
+
+            # LP lock: problematic if any risk with "LP" in name at warn or danger level
+            lp_risk = any(
+                "lp" in (r.get("name") or "").lower()
+                and r.get("level") in ("warn", "danger")
+                for r in risks
+            )
+            lp_locked = not lp_risk
+
+            rugcheck_score = int(score) if score is not None else None
+
+            log.debug(
+                f"RugCheck {mint[:8]}…: score={rugcheck_score} "
+                f"mint_renounced={mint_renounced} lp_locked={lp_locked}"
+            )
+            return {
+                "mint_renounced": mint_renounced,
+                "lp_locked": lp_locked,
+                "rugcheck_score": rugcheck_score,
+            }
+        except Exception as exc:
+            log.warning(f"RugCheck fetch failed for {mint[:8]}… (non-fatal): {exc}")
+            return fail_result
+
+    async def _fetch_pumpfun_status(self, mint: str) -> dict:
+        """
+        Check if a token migrated from pump.fun bonding curve to Raydium.
+        Returns dict with is_pumpfun_migration.
+        404 = not a pump.fun token (valid result: False). Other errors = None (fail open).
+        """
+        try:
+            session = await self._dex_session()
+            url = f"https://frontend-api.pump.fun/coins/{mint}"
+            async with session.get(url) as resp:
+                if resp.status == 404:
+                    return {"is_pumpfun_migration": False}
+                if resp.status != 200:
+                    log.warning(
+                        f"pump.fun HTTP {resp.status} for {mint[:8]}… — skipping check"
+                    )
+                    return {"is_pumpfun_migration": None}
+                data = await resp.json(content_type=None)
+
+            is_migration = data.get("complete") is True
+            if is_migration:
+                log.debug(f"pump.fun migration detected for {mint[:8]}…")
+            return {"is_pumpfun_migration": is_migration}
+        except Exception as exc:
+            log.warning(f"pump.fun fetch failed for {mint[:8]}… (non-fatal): {exc}")
+            return {"is_pumpfun_migration": None}
 
     # ══════════════════════════════════════════════════════════
     # SOL Price Tracking (v5.0)

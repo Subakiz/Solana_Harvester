@@ -969,7 +969,39 @@ class PaperTradingEngine:
             )
             return
 
+        # ── 5a. RugCheck score gate (v5.2) ─────────────────────
+        if (buf.rugcheck_score is not None
+                and buf.rugcheck_score > Settings.RUGCHECK_MAX_SCORE):
+            reason = f"RUGCHECK_SCORE_TOO_HIGH (score={buf.rugcheck_score}, max={Settings.RUGCHECK_MAX_SCORE})"
+            log.debug(f"  ❌ {buf.symbol}: {reason}")
+            await self.db.insert_filter_rejection(
+                mint=buf.mint, symbol=buf.symbol, rejection_reason=reason,
+                price_usd=price, liquidity_usd=liquidity, volume_5m=volume,
+                buys_5m=buys, sells_5m=sells, market_cap=mcap,
+                buy_ratio=buy_ratio,
+            )
+            return
+
+        # ── 5b. LP lock gate (v5.2, optional) ─────────────────
+        if (Settings.RUGCHECK_REQUIRE_LP_LOCKED
+                and buf.lp_locked is not None
+                and buf.lp_locked is False):
+            reason = "LP_NOT_LOCKED"
+            log.debug(f"  ❌ {buf.symbol}: {reason}")
+            await self.db.insert_filter_rejection(
+                mint=buf.mint, symbol=buf.symbol, rejection_reason=reason,
+                price_usd=price, liquidity_usd=liquidity, volume_5m=volume,
+                buys_5m=buys, sells_5m=sells, market_cap=mcap,
+                buy_ratio=buy_ratio,
+            )
+            return
+
         # ── 6. Token age check (v5.0) ────────────────────────
+        # Pump.fun migration bonus: bypass age-too-young gate (v5.2)
+        pumpfun_age_bypass = (
+            Settings.PUMPFUN_MIGRATION_BONUS
+            and buf.is_pumpfun_migration is True
+        )
         token_age_minutes: Optional[float] = None
         if buf.pair_created_at is not None:
             token_age_seconds = time.time() - buf.pair_created_at
@@ -977,15 +1009,20 @@ class PaperTradingEngine:
             min_age_s = Settings.TOKEN_MIN_AGE_MINUTES * 60
             max_age_s = Settings.TOKEN_MAX_AGE_HOURS * 3600
             if token_age_seconds < min_age_s:
-                reason = f"TOKEN_TOO_YOUNG (age={token_age_minutes:.1f}min, min={Settings.TOKEN_MIN_AGE_MINUTES:.0f}min)"
-                log.debug(f"  ❌ {buf.symbol}: {reason}")
-                await self.db.insert_filter_rejection(
-                    mint=buf.mint, symbol=buf.symbol, rejection_reason=reason,
-                    price_usd=price, liquidity_usd=liquidity, volume_5m=volume,
-                    buys_5m=buys, sells_5m=sells, market_cap=mcap,
-                    buy_ratio=buy_ratio, token_age_minutes=token_age_minutes,
-                )
-                return
+                if pumpfun_age_bypass:
+                    log.info(
+                        f"  ⚡ {buf.symbol}: pump.fun migration — bypassing age gate"
+                    )
+                else:
+                    reason = f"TOKEN_TOO_YOUNG (age={token_age_minutes:.1f}min, min={Settings.TOKEN_MIN_AGE_MINUTES:.0f}min)"
+                    log.debug(f"  ❌ {buf.symbol}: {reason}")
+                    await self.db.insert_filter_rejection(
+                        mint=buf.mint, symbol=buf.symbol, rejection_reason=reason,
+                        price_usd=price, liquidity_usd=liquidity, volume_5m=volume,
+                        buys_5m=buys, sells_5m=sells, market_cap=mcap,
+                        buy_ratio=buy_ratio, token_age_minutes=token_age_minutes,
+                    )
+                    return
             if token_age_seconds > max_age_s:
                 reason = f"TOKEN_TOO_OLD (age={token_age_minutes:.1f}min, max={Settings.TOKEN_MAX_AGE_HOURS:.0f}h)"
                 log.debug(f"  ❌ {buf.symbol}: {reason}")

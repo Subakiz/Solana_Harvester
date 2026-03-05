@@ -84,6 +84,12 @@ async def main():
         f"{Settings.MAX_LIQUIDITY_PCT:.0%} liq | "
         f"Max {Settings.MAX_OPEN_TRADES} positions"
     )
+    log.info(
+        f"🔒 Safety: RugCheck={'ON' if Settings.RUGCHECK_ENABLED else 'OFF'} | "
+        f"MintRenounced={'REQUIRED' if Settings.RUGCHECK_REQUIRE_MINT_RENOUNCED else 'optional'} | "
+        f"LPLocked={'REQUIRED' if Settings.RUGCHECK_REQUIRE_LP_LOCKED else 'optional'} | "
+        f"Pump.fun={'ON' if Settings.PUMPFUN_MIGRATION_BONUS else 'OFF'}"
+    )
     print()
     
     # ── Signal handlers ──────────────────────────────────────

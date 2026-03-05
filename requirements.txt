@@ -3,4 +3,4 @@ aiosqlite==0.20.0
 python-dotenv==1.0.1
 numpy==1.26.4
 colorlog==6.8.2
-orjson==3.10.3
+orjson

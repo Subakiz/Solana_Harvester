@@ -209,6 +209,14 @@ class Settings:
     PORTFOLIO_HEAT_LIMIT_PCT: float = _env("PORTFOLIO_HEAT_LIMIT_PCT", -0.05, float)
     PORTFOLIO_HEAT_PAUSE_MINUTES: float = _env("PORTFOLIO_HEAT_PAUSE_MINUTES", 30.0, float)
 
+    # ── Safety Enrichment (v5.2) ───────────────────────────
+    RUGCHECK_ENABLED: bool = _env("RUGCHECK_ENABLED", True, lambda v: v.lower() in ("1", "true", "yes"))
+    RUGCHECK_MAX_SCORE: int = _env("RUGCHECK_MAX_SCORE", 1000, int)
+    RUGCHECK_REQUIRE_MINT_RENOUNCED: bool = _env("RUGCHECK_REQUIRE_MINT_RENOUNCED", True, lambda v: v.lower() in ("1", "true", "yes"))
+    RUGCHECK_REQUIRE_LP_LOCKED: bool = _env("RUGCHECK_REQUIRE_LP_LOCKED", False, lambda v: v.lower() in ("1", "true", "yes"))
+    PUMPFUN_CHECK_ENABLED: bool = _env("PUMPFUN_CHECK_ENABLED", True, lambda v: v.lower() in ("1", "true", "yes"))
+    PUMPFUN_MIGRATION_BONUS: bool = _env("PUMPFUN_MIGRATION_BONUS", True, lambda v: v.lower() in ("1", "true", "yes"))
+
     @classmethod
     def summary(cls) -> dict[str, str]:
         """Return a dict of key settings for display at startup."""
@@ -238,4 +246,8 @@ class Settings:
             "SOL regime": "ON" if cls.SOL_REGIME_ENABLED else "OFF",
             "ATR TP range": f"{cls.ATR_TP_MIN:.0%}–{cls.ATR_TP_MAX:.0%}",
             "SL (thin/med/deep)": f"{cls.SL_THIN_POOL_PCT:.0%}/{cls.SL_MEDIUM_POOL_PCT:.0%}/{cls.SL_DEEP_POOL_PCT:.0%}",
+            "RugCheck": "ON" if cls.RUGCHECK_ENABLED else "OFF",
+            "Mint renounced": "REQUIRED" if cls.RUGCHECK_REQUIRE_MINT_RENOUNCED else "optional",
+            "LP locked": "REQUIRED" if cls.RUGCHECK_REQUIRE_LP_LOCKED else "optional",
+            "Pump.fun bonus": "ON" if cls.PUMPFUN_MIGRATION_BONUS else "OFF",
         }

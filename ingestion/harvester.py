@@ -621,6 +621,7 @@ class DataHarvester:
                 hot_min_mcap=Settings.HOT_MIN_MCAP,
                 hot_max_mcap=Settings.HOT_MAX_MCAP,
                 hot_min_activity=Settings.HOT_MIN_ACTIVITY,
+                hot_max_age_hours=Settings.TOKEN_MAX_AGE_HOURS,
                 dead_zero_vol_polls=Settings.DEAD_TOKEN_ZERO_VOL_POLLS,
                 dead_min_liquidity=Settings.DEAD_TOKEN_MIN_LIQUIDITY,
                 stale_max_age_hours=Settings.STALE_TOKEN_MAX_AGE_HOURS,
@@ -717,6 +718,7 @@ class DataHarvester:
             hot_min_mcap=Settings.HOT_MIN_MCAP,
             hot_max_mcap=Settings.HOT_MAX_MCAP,
             hot_min_activity=Settings.HOT_MIN_ACTIVITY,
+            hot_max_age_hours=Settings.TOKEN_MAX_AGE_HOURS,
             dead_zero_vol_polls=Settings.DEAD_TOKEN_ZERO_VOL_POLLS,
             dead_min_liquidity=Settings.DEAD_TOKEN_MIN_LIQUIDITY,
             stale_max_age_hours=Settings.STALE_TOKEN_MAX_AGE_HOURS,
@@ -919,7 +921,7 @@ class DataHarvester:
         return [
             t for t in self.tokens.values()
             if t.count >= Settings.MIN_SNAPSHOTS_HURST
-            and t.latest_liquidity >= Settings.MIN_LIQUIDITY
+            and t.latest_liquidity >= Settings.TRACKING_MIN_LIQUIDITY
         ]
 
     def get(self, mint: str) -> Optional[TokenBuffer]:

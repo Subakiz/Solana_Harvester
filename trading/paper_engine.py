@@ -682,7 +682,8 @@ class PaperTradingEngine:
         else:
             # ── Full exit ──
             result = await self.db.close_paper_trade(
-                pos.trade_id, exit_price, reason, cost_info=cost_info
+                pos.trade_id, exit_price, reason, cost_info=cost_info,
+                final_usd_size=pos.usd_size
             )
             del self.positions[pos.mint]
 

@@ -354,7 +354,8 @@ class DatabaseManager:
             raise
 
     async def close_paper_trade(self, trade_id: str, exit_price: float,
-                                reason: str, cost_info: Optional[dict] = None):
+                                reason: str, cost_info: Optional[dict] = None,
+                                final_usd_size: Optional[float] = None):
         """Close a paper trade with optional cost model data."""
         now = time.time()
         try:
@@ -367,7 +368,7 @@ class DatabaseManager:
                 return
 
             entry_price = row["entry_price"]
-            usd_size = row["usd_size"] or 0.0
+            usd_size = final_usd_size if final_usd_size is not None else (row["usd_size"] or 0.0)
 
             # Calculate raw PnL
             raw_pnl_pct = (exit_price - entry_price) / entry_price if entry_price > 0 else 0.0
